@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { PiAgent, dreamDueAt, DREAM_PROMPT, MEMORY_INSTRUCTIONS, parseAttachLines, parseCommand, parseSavedClaims, REMEMBER_INTENT, REMEMBER_INTENT_EN, IMAGE_MAX_BYTES, IMAGE_MIME_WHITELIST, attachMediaType, sniffImageMime } from "../dist/pi-agent.js";
+import { PiAgent, dreamDueAt, DREAM_PROMPT, MEMORY_INSTRUCTIONS, parseAttachLines, parseCommand, parseSavedClaims, REMEMBER_INTENT, REMEMBER_INTENT_EN, attachMediaType, sniffImageMime } from "../dist/pi-agent.js";
 import { indexLineCount, readMemoryStore, sameMemoryStore, MEMORY_INDEX_MAX_LINES } from "../dist/memory.js";
 import { hash, readState } from "../dist/state.js";
 import { loadConfig } from "../dist/config.js";
@@ -294,73 +294,73 @@ test("shutdown aborts work, suppresses replies and disposes sessions", async t =
   assert.match((await agent.chat(message("later"))).text, /不可用/);
 });
 
-test("B1 inbound image: SDK-reported \"image/*\" is sniffed from magic bytes; .bin temp names are fine", async t => {
+test("B1 inbound image: copied to media/ with the sniffed extension; no image bytes enter the prompt", async t => {
   const f = fixture(t);
   const agent = f.make();
   await f.claim(agent);
   // Real magic headers; the SDK stores images as .bin temp files with mimeType "image/*".
   const magic = [
-    ["png", Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from("payload")])],
-    ["jpeg", Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from("payload")])],
-    ["gif", Buffer.concat([Buffer.from("GIF89a", "latin1"), Buffer.from("payload")])],
-    ["webp", Buffer.concat([Buffer.from("RIFF", "latin1"), Buffer.alloc(4), Buffer.from("WEBP", "latin1"), Buffer.from("payload")])],
+    ["png", ".png", Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from("payload")])],
+    ["jpeg", ".jpg", Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from("payload")])],
+    ["gif", ".gif", Buffer.concat([Buffer.from("GIF89a", "latin1"), Buffer.from("payload")])],
+    ["webp", ".webp", Buffer.concat([Buffer.from("RIFF", "latin1"), Buffer.alloc(4), Buffer.from("WEBP", "latin1"), Buffer.from("payload")])],
   ];
-  for (const [kind, bytes] of magic) {
-    const mimeType = `image/${kind}`;
-    assert.ok(IMAGE_MIME_WHITELIST.has(mimeType), `${mimeType} must be whitelisted`);
+  for (const [kind, ext, bytes] of magic) {
     const filePath = join(f.dataDir, `1770000000-abcd${kind}.bin`);
     writeFileSync(filePath, bytes);
-    const response = await agent.chat({
-      ...message(`看看这张${kind}`),
-      media: { type: "image", filePath, mimeType: "image/*" },
-    });
+    const response = await agent.chat({ ...message(`看看这张${kind}`), media: { type: "image", filePath, mimeType: "image/*" } });
     assert.equal(response.text.startsWith("reply:"), true, `${kind} must not fail the chat`);
     const session = f.sessions[0];
-    const images = session.imageCalls.at(-1);
-    assert.equal(images.length, 1, `${kind} must attach exactly one image`);
-    assert.equal(images[0].type, "image");
-    assert.equal(images[0].mimeType, mimeType, `${kind} sniffed mime`);
-    assert.equal(images[0].data, bytes.toString("base64"));
-    assert.match(session.calls.at(-1), /\[图片\]/, "no fileName means a bare [图片] tag");
+    // The copy is byte-identical under media/ with the sniffed extension.
+    const stored = join(session.cwd, "media", `1770000000-abcd${kind}${ext}`);
+    assert.deepEqual(readFileSync(stored), bytes, `${kind} persisted under media/`);
+    assert.match(session.calls.at(-1), new RegExp(`\\[图片: media/1770000000-abcd${kind}${ext.replace(".", "\\.")}（已保存在工作区，可用图片工具查看。）\\]`));
+    // No image attachment and no base64 payload may reach the prompt.
+    assert.equal(session.imageCalls.at(-1).length, 0, `${kind} must not be inlined`);
+    assert.ok(!session.calls.at(-1).includes(bytes.toString("base64")), "no base64 in the prompt");
   }
-  // An explicit fileName appears in the annotation.
-  writeFileSync(join(f.dataDir, "photo.jpg"), Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from("x")]));
-  await agent.chat({
-    ...message("带名字的"),
-    media: { type: "image", filePath: join(f.dataDir, "photo.jpg"), mimeType: "image/*", fileName: "photo.jpg" },
-  });
-  assert.equal(f.sessions[0].imageCalls.at(-1)[0].mimeType, "image/jpeg");
-  assert.match(f.sessions[0].calls.at(-1), /\[图片: photo\.jpg\]/);
-  // Sniff wins when the reported mime disagrees with the actual bytes.
-  writeFileSync(join(f.dataDir, "labeled.png"), Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from("x")]));
-  await agent.chat({ ...message("标错的"), media: { type: "image", filePath: join(f.dataDir, "labeled.png"), mimeType: "image/jpeg" } });
-  assert.equal(f.sessions[0].imageCalls.at(-1)[0].mimeType, "image/png", "sniffed type preferred over reported mime");
+  // A real extension on the name is kept; the annotation names the stored copy.
+  const jpg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from("x")]);
+  writeFileSync(join(f.dataDir, "photo.jpg"), jpg);
+  await agent.chat({ ...message("带名字的"), media: { type: "image", filePath: join(f.dataDir, "photo.jpg"), mimeType: "image/*", fileName: "photo.jpg" } });
+  assert.deepEqual(readFileSync(join(f.sessions[0].cwd, "media", "photo.jpg")), jpg);
+  assert.match(f.sessions[0].calls.at(-1), /\[图片: media\/photo\.jpg（已保存在工作区，可用图片工具查看。）\]/);
+  assert.equal(f.sessions[0].imageCalls.at(-1).length, 0);
   await agent.close();
 });
 
-test("B1 inbound image degrades on unknown magic, oversize, or unreadable", async t => {
+test("B1 unknown-magic image is copied as .bin and still referenced by path", async t => {
   const f = fixture(t);
   const agent = f.make();
   await f.claim(agent);
-  const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-  const oversized = join(f.dataDir, "big.bin");
-  writeFileSync(oversized, Buffer.concat([pngHeader, Buffer.alloc(IMAGE_MAX_BYTES + 1 - pngHeader.length)]));
-  const garbage = join(f.dataDir, "garbage.bin");
-  writeFileSync(garbage, Buffer.from("not an image at all"));
-  const cases = [
-    { media: { type: "image", filePath: garbage, mimeType: "image/*" }, reason: "无法识别图片格式" }, // unknown magic
-    { media: { type: "image", filePath: garbage, mimeType: "image/png" }, reason: "无法识别图片格式" }, // sniff still wins
-    { media: { type: "image", filePath: oversized, mimeType: "image/*" }, reason: "超过大小上限" }, // real PNG, over cap
-    { media: { type: "image", filePath: join(f.dataDir, "missing.bin"), mimeType: "image/*" }, reason: "读取失败" },
-    { media: { type: "image", filePath: f.dataDir, mimeType: "image/*" }, reason: "无法读取文件" }, // directory
-  ];
-  for (const { media, reason } of cases) {
-    const response = await agent.chat({ ...message("看看"), media });
-    assert.match(response.text, new RegExp(reason), `degrade annotation for ${media.filePath}`);
-    assert.equal(response.text.startsWith("reply:"), true, "chat must not fail");
-  }
+  const bytes = Buffer.from("not an image at all");
+  const filePath = join(f.dataDir, "1770000000-xyz.bin");
+  writeFileSync(filePath, bytes);
+  const response = await agent.chat({ ...message("看看"), media: { type: "image", filePath, mimeType: "image/*" } });
+  assert.equal(response.text.startsWith("reply:"), true);
   const session = f.sessions[0];
-  assert.ok(session.imageCalls.every(images => images.length === 0), "no image attachments on degrade");
+  assert.deepEqual(readFileSync(join(session.cwd, "media", "1770000000-xyz.bin")), bytes);
+  assert.match(session.calls.at(-1), /\[图片: media\/1770000000-xyz\.bin（已保存在工作区，可用图片工具查看。）\]/);
+  assert.equal(session.imageCalls.at(-1).length, 0);
+  await agent.close();
+});
+
+test("B1 image copy failure degrades to an annotation and never throws", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  await agent.chat(message("warmup")); // Creates the workspace.
+  const session = f.sessions[0];
+  // A plain file named media/ blocks the media directory creation.
+  writeFileSync(join(session.cwd, "media"), "not a directory");
+  writeFileSync(join(f.dataDir, "blocked.bin"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  let response = await agent.chat({ ...message("看图"), media: { type: "image", filePath: join(f.dataDir, "blocked.bin"), mimeType: "image/*" } });
+  assert.match(response.text, /保存失败，未提供路径/);
+  assert.match(response.text, /^reply:/, "chat must not fail");
+  assert.equal(session.imageCalls.at(-1).length, 0);
+  // A missing source file degrades the same way; no absolute path leaks into the prompt.
+  response = await agent.chat({ ...message("丢失的图"), media: { type: "image", filePath: join(f.dataDir, "gone.bin"), mimeType: "image/*" } });
+  assert.match(response.text, /保存失败，未提供路径/);
   assert.ok(!session.calls.some(call => call.includes(f.dataDir)), "no absolute source path leaks into the prompt");
   await agent.close();
 });

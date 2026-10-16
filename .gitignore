@@ -12,8 +12,12 @@ dev-log/
 
 # local agent runtime artifacts
 .pi/subagents/
+.bot.pid
 
 # misc
 *.log
 .env
 .DS_Store
+
+# local run script (machine-specific proxy/env; make your own)
+start.sh

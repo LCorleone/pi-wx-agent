@@ -2,6 +2,33 @@ import { mkdirSync } from "node:fs";
 import { loadConfig } from "./config.js";
 import { PiAgent } from "./pi-agent.js";
 
+/**
+ * pi's session factory installs its bundled undici as the global fetch implementation
+ * (pi-coding-agent dist/core/http-dispatcher.js). That newer undici strictly follows the
+ * fetch spec and rejects requests that set a manual "Content-Length" header, while
+ * weixin-agent-sdk sets that header on every request (its api.ts buildHeaders). The result
+ * is "InvalidArgumentError: invalid content-length header" on every long-poll once a Pi
+ * session factory exists. Strip the forbidden header here; undici computes the correct
+ * value itself. Must be installed AFTER the Pi session factory (pi installs its globals
+ * there) and BEFORE the WeChat SDK starts polling.
+ */
+function installFetchCompatShim(): void {
+  const current = globalThis.fetch;
+  if ((current as { __wxCompat?: boolean }).__wxCompat) return;
+  const wrapped: typeof fetch = async (input, init) => {
+    if (init?.body != null && init.headers != null) {
+      const headers = new Headers(init.headers);
+      if (headers.has("content-length")) {
+        headers.delete("content-length");
+        init = { ...init, headers };
+      }
+    }
+    return current(input, init);
+  };
+  (wrapped as { __wxCompat?: boolean }).__wxCompat = true;
+  globalThis.fetch = wrapped;
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args.includes("--help")) {
@@ -46,6 +73,7 @@ async function main(): Promise<void> {
     if (command === "start") {
       const { createSessionFactory } = await import("./pi-session.js");
       agent = new PiAgent(config, await createSessionFactory(config));
+      installFetchCompatShim();
     }
     const weixin = await import("weixin-agent-sdk");
     if (controller.signal.aborted) return;
