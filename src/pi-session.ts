@@ -4,13 +4,13 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { Config } from "./config.js";
 import { AssistantResponseError, MissingMappedSessionError } from "./diagnostics.js";
-import type { BridgeSession, SessionFactory, SessionIntrospection } from "./pi-agent.js";
+import type { BridgeSession, PromptImage, SessionFactory, SessionIntrospection } from "./pi-agent.js";
 
 /** Only completed assistant events from THIS prompt may become a WeChat reply. */
 export function wrapSession(session: AgentSession): BridgeSession {
   return {
     get isIdle() { return session.isIdle; },
-    async run(text) {
+    async run(text, images) {
       if (!session.isIdle) throw new Error("Session is busy");
       let reply: string | undefined;
       let stopReason: string = "none";
@@ -21,7 +21,7 @@ export function wrapSession(session: AgentSession): BridgeSession {
         }
       });
       try {
-        await session.prompt(text);
+        await session.prompt(text, images && images.length ? { images } : undefined);
         if (stopReason !== "stop" || reply === undefined) throw new AssistantResponseError(stopReason);
         return reply || "（本轮无文字回复）";
       } finally { unsubscribe(); }

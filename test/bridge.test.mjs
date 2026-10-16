@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { PiAgent, dreamDueAt, DREAM_PROMPT, MEMORY_INSTRUCTIONS, parseCommand, parseSavedClaims, REMEMBER_INTENT, REMEMBER_INTENT_EN } from "../dist/pi-agent.js";
+import { PiAgent, dreamDueAt, DREAM_PROMPT, MEMORY_INSTRUCTIONS, parseAttachLines, parseCommand, parseSavedClaims, REMEMBER_INTENT, REMEMBER_INTENT_EN, IMAGE_MAX_BYTES, IMAGE_MIME_WHITELIST, attachMediaType, sniffImageMime } from "../dist/pi-agent.js";
 import { indexLineCount, readMemoryStore, sameMemoryStore, MEMORY_INDEX_MAX_LINES } from "../dist/memory.js";
 import { hash, readState } from "../dist/state.js";
 import { loadConfig } from "../dist/config.js";
@@ -23,12 +23,13 @@ function fixture(t, hour = 3) {
   const logs = [];
   const factory = async (cwd, record) => {
     const session = {
-      cwd, id: record.sessionId, isIdle: true, calls: [], disposed: false,
+      cwd, id: record.sessionId, isIdle: true, calls: [], imageCalls: [], disposed: false,
       gate: undefined, started: deferred(), fail: false, compactCalls: 0, abortCalls: 0,
-      async run(text) {
+      async run(text, images) {
         assert.equal(this.isIdle, true, "no overlapping prompts");
         this.isIdle = false;
         this.calls.push(text);
+        this.imageCalls.push(images ?? []);
         this.started.resolve();
         try {
           if (this.gate) await this.gate.promise;
@@ -293,14 +294,312 @@ test("shutdown aborts work, suppresses replies and disposes sessions", async t =
   assert.match((await agent.chat(message("later"))).text, /不可用/);
 });
 
-test("media passes only a placeholder; no file path is given to Pi", async t => {
+test("B1 inbound image: SDK-reported \"image/*\" is sniffed from magic bytes; .bin temp names are fine", async t => {
   const f = fixture(t);
   const agent = f.make();
   await f.claim(agent);
-  await agent.chat({ ...message("caption"), media: { type: "image", filePath: "/private/file", mimeType: "image/png" } });
-  assert.match(f.sessions[0].calls[0], /未读取附件/);
-  assert.doesNotMatch(f.sessions[0].calls[0], /private/);
+  // Real magic headers; the SDK stores images as .bin temp files with mimeType "image/*".
+  const magic = [
+    ["png", Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from("payload")])],
+    ["jpeg", Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from("payload")])],
+    ["gif", Buffer.concat([Buffer.from("GIF89a", "latin1"), Buffer.from("payload")])],
+    ["webp", Buffer.concat([Buffer.from("RIFF", "latin1"), Buffer.alloc(4), Buffer.from("WEBP", "latin1"), Buffer.from("payload")])],
+  ];
+  for (const [kind, bytes] of magic) {
+    const mimeType = `image/${kind}`;
+    assert.ok(IMAGE_MIME_WHITELIST.has(mimeType), `${mimeType} must be whitelisted`);
+    const filePath = join(f.dataDir, `1770000000-abcd${kind}.bin`);
+    writeFileSync(filePath, bytes);
+    const response = await agent.chat({
+      ...message(`看看这张${kind}`),
+      media: { type: "image", filePath, mimeType: "image/*" },
+    });
+    assert.equal(response.text.startsWith("reply:"), true, `${kind} must not fail the chat`);
+    const session = f.sessions[0];
+    const images = session.imageCalls.at(-1);
+    assert.equal(images.length, 1, `${kind} must attach exactly one image`);
+    assert.equal(images[0].type, "image");
+    assert.equal(images[0].mimeType, mimeType, `${kind} sniffed mime`);
+    assert.equal(images[0].data, bytes.toString("base64"));
+    assert.match(session.calls.at(-1), /\[图片\]/, "no fileName means a bare [图片] tag");
+  }
+  // An explicit fileName appears in the annotation.
+  writeFileSync(join(f.dataDir, "photo.jpg"), Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from("x")]));
+  await agent.chat({
+    ...message("带名字的"),
+    media: { type: "image", filePath: join(f.dataDir, "photo.jpg"), mimeType: "image/*", fileName: "photo.jpg" },
+  });
+  assert.equal(f.sessions[0].imageCalls.at(-1)[0].mimeType, "image/jpeg");
+  assert.match(f.sessions[0].calls.at(-1), /\[图片: photo\.jpg\]/);
+  // Sniff wins when the reported mime disagrees with the actual bytes.
+  writeFileSync(join(f.dataDir, "labeled.png"), Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from("x")]));
+  await agent.chat({ ...message("标错的"), media: { type: "image", filePath: join(f.dataDir, "labeled.png"), mimeType: "image/jpeg" } });
+  assert.equal(f.sessions[0].imageCalls.at(-1)[0].mimeType, "image/png", "sniffed type preferred over reported mime");
   await agent.close();
+});
+
+test("B1 inbound image degrades on unknown magic, oversize, or unreadable", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const oversized = join(f.dataDir, "big.bin");
+  writeFileSync(oversized, Buffer.concat([pngHeader, Buffer.alloc(IMAGE_MAX_BYTES + 1 - pngHeader.length)]));
+  const garbage = join(f.dataDir, "garbage.bin");
+  writeFileSync(garbage, Buffer.from("not an image at all"));
+  const cases = [
+    { media: { type: "image", filePath: garbage, mimeType: "image/*" }, reason: "无法识别图片格式" }, // unknown magic
+    { media: { type: "image", filePath: garbage, mimeType: "image/png" }, reason: "无法识别图片格式" }, // sniff still wins
+    { media: { type: "image", filePath: oversized, mimeType: "image/*" }, reason: "超过大小上限" }, // real PNG, over cap
+    { media: { type: "image", filePath: join(f.dataDir, "missing.bin"), mimeType: "image/*" }, reason: "读取失败" },
+    { media: { type: "image", filePath: f.dataDir, mimeType: "image/*" }, reason: "无法读取文件" }, // directory
+  ];
+  for (const { media, reason } of cases) {
+    const response = await agent.chat({ ...message("看看"), media });
+    assert.match(response.text, new RegExp(reason), `degrade annotation for ${media.filePath}`);
+    assert.equal(response.text.startsWith("reply:"), true, "chat must not fail");
+  }
+  const session = f.sessions[0];
+  assert.ok(session.imageCalls.every(images => images.length === 0), "no image attachments on degrade");
+  assert.ok(!session.calls.some(call => call.includes(f.dataDir)), "no absolute source path leaks into the prompt");
+  await agent.close();
+});
+
+test("B1 sniffImageMime unit: magic table and unknown/empty files", t => {
+  const f = fixture(t);
+  const put = (name, bytes) => { const p = join(f.dataDir, name); writeFileSync(p, bytes); return p; };
+  assert.equal(sniffImageMime(put("a", Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]))), "image/png");
+  assert.equal(sniffImageMime(put("b", Buffer.from([0xff, 0xd8, 0xff, 0xdb]))), "image/jpeg");
+  assert.equal(sniffImageMime(put("c", Buffer.from("GIF87a01", "latin1"))), "image/gif");
+  assert.equal(sniffImageMime(put("d", Buffer.from("GIF89a01", "latin1"))), "image/gif");
+  assert.equal(sniffImageMime(put("e", Buffer.concat([Buffer.from("RIFF", "latin1"), Buffer.alloc(4), Buffer.from("WEBPVP8 ", "latin1")]))), "image/webp");
+  assert.equal(sniffImageMime(put("g", Buffer.concat([Buffer.from("RIFF", "latin1"), Buffer.alloc(4), Buffer.from("XXXX", "latin1")]))), null, "RIFF but not WEBP");
+  assert.equal(sniffImageMime(put("h", Buffer.from("GIF99a", "latin1"))), null, "unknown GIF variant");
+  assert.equal(sniffImageMime(put("i", Buffer.alloc(0))), null, "empty file");
+  assert.equal(sniffImageMime(put("j", Buffer.from("BM\u0002", "latin1"))), null, "BMP is not supported");
+});
+
+test("B1 inbound file and video are copied into workspace media/ and annotated by relative path", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  const src = join(f.dataDir, "doc.pdf");
+  writeFileSync(src, "PDFDATA");
+  let response = await agent.chat({
+    ...message("帮我总结"),
+    media: { type: "file", filePath: src, mimeType: "application/pdf", fileName: "年报.pdf" },
+  });
+  const session = f.sessions[0];
+  const stored = join(session.cwd, "media", "年报.pdf");
+  assert.equal(readFileSync(stored, "utf8"), "PDFDATA");
+  assert.match(session.calls[0], /帮我总结\n\[文件: media\/年报\.pdf/);
+  assert.equal(session.imageCalls[0].length, 0);
+  assert.ok(!session.calls[0].includes(f.dataDir), "prompt carries the workspace-relative path only");
+  assert.equal(response.text.startsWith("reply:"), true);
+
+  // Same filename again: a collision suffix keeps both files, prompt names the new one.
+  writeFileSync(src, "PDFDATA2");
+  await agent.chat({ ...message("再总结"), media: { type: "file", filePath: src, mimeType: "application/pdf", fileName: "年报.pdf" } });
+  assert.match(session.calls[1], /\[文件: media\/年报-1\.pdf/);
+  assert.equal(readFileSync(join(session.cwd, "media", "年报-1.pdf"), "utf8"), "PDFDATA2");
+  assert.equal(readFileSync(stored, "utf8"), "PDFDATA", "first copy untouched");
+
+  // Video is treated like a file (no video input for Pi).
+  const vid = join(f.dataDir, "clip.mp4");
+  writeFileSync(vid, "VID");
+  await agent.chat({ ...message("看视频"), media: { type: "video", filePath: vid, mimeType: "video/mp4", fileName: "clip.mp4" } });
+  assert.match(session.calls[2], /\[视频: media\/clip\.mp4/);
+  assert.equal(readFileSync(join(session.cwd, "media", "clip.mp4"), "utf8"), "VID");
+
+  // Hostile filenames cannot escape media/, and missing sources degrade instead of failing.
+  writeFileSync(src, "SH");
+  await agent.chat({ ...message("脚本"), media: { type: "file", filePath: src, mimeType: "text/x-sh", fileName: "../../evil.sh" } });
+  assert.match(session.calls[3], /\[文件: media\/evil\.sh/);
+  assert.equal(readFileSync(join(session.cwd, "media", "evil.sh"), "utf8"), "SH");
+  const degraded = await agent.chat({
+    ...message("丢失的文件"), media: { type: "file", filePath: join(f.dataDir, "nope.bin"), mimeType: "application/octet-stream", fileName: "nope.bin" },
+  });
+  assert.match(degraded.text, /保存失败/);
+  assert.match(degraded.text, /reply:/);
+  await agent.close();
+});
+
+test("B2 audio: transcription passes through with a note; empty transcription annotates only", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  const voice = { type: "audio", filePath: join(f.dataDir, "v.wav"), mimeType: "audio/wav" };
+  await agent.chat({ ...message("明天提醒我开会"), media: voice });
+  assert.equal(f.sessions[0].calls[0], "[语音] 明天提醒我开会");
+  assert.equal(f.sessions[0].imageCalls[0].length, 0);
+  await agent.chat({ conversationId: "owner", text: "", media: voice });
+  assert.match(f.sessions[0].calls[1], /语音消息：转写不可用/);
+  assert.equal(f.sessions[0].imageCalls[1].length, 0);
+  await agent.close();
+});
+
+test("B4 ATTACH: valid image/video/file lines are stripped and delivered as the sole attachment", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  await agent.chat(message("warmup"));
+  const session = f.sessions[0];
+  mkdirSync(join(session.cwd, "media"), { recursive: true });
+  writeFileSync(join(session.cwd, "media", "chart.png"), "PNG");
+  writeFileSync(join(session.cwd, "media", "clip.mp4"), "MP4");
+  writeFileSync(join(session.cwd, "media", "data.zip"), "ZIP");
+
+  session.run = async () => "图已生成。\nATTACH: media/chart.png";
+  let response = await agent.chat(message("画个图"));
+  assert.equal(response.text, "图已生成。");
+  assert.equal(response.media.type, "image");
+  assert.equal(response.media.url, realpathSync(join(session.cwd, "media", "chart.png")));
+  assert.equal(response.media.fileName, "chart.png");
+
+  session.run = async () => "ATTACH: media/clip.mp4";
+  response = await agent.chat(message("视频"));
+  assert.equal(response.text, "（本轮无文字回复）");
+  assert.equal(response.media.type, "video");
+
+  session.run = async () => "打包好了。\nATTACH: media/data.zip";
+  response = await agent.chat(message("打包"));
+  assert.equal(response.media.type, "file");
+  assert.equal(response.text, "打包好了。");
+
+  // A reply without the marker never produces media.
+  session.run = async () => "纯文字。";
+  response = await agent.chat(message("纯文字"));
+  assert.equal(response.media, undefined);
+  assert.equal(response.text, "纯文字。");
+  await agent.close();
+});
+
+test("B4 ATTACH rejects traversal, missing files and directories; extras beyond the first are dropped", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  await agent.chat(message("warmup"));
+  const session = f.sessions[0];
+  mkdirSync(join(session.cwd, "media", "subdir"), { recursive: true });
+  const rejected = () => f.logs.filter(line => line.includes("category=attach-rejected")).length;
+  const dropped = () => f.logs.filter(line => line.includes("category=attach-dropped")).length;
+
+  // Absolute or ../ paths stay rejected even when they point at a real outside file.
+  writeFileSync(join(f.dataDir, "secret.txt"), "S");
+  for (const path of ["../../../etc/passwd", join(f.dataDir, "secret.txt"), "/etc/passwd", ".", "media/subdir"]) {
+    session.run = async () => `结果。\nATTACH: ${path}`;
+    const response = await agent.chat(message("拿文件"));
+    assert.equal(response.media, undefined, `${path} must be rejected`);
+    assert.equal(response.text, "结果。", "text stays minus the marker");
+  }
+  assert.equal(rejected(), 5);
+
+  // A missing file inside the workspace is rejected too.
+  session.run = async () => "结果。\nATTACH: media/missing.png";
+  const response = await agent.chat(message("拿文件"));
+  assert.equal(response.media, undefined);
+  assert.equal(response.text, "结果。");
+  assert.equal(rejected(), 6);
+
+  // Multiple trailing ATTACH lines: only the first is honored, the rest dropped with a diagnostic.
+  writeFileSync(join(session.cwd, "media", "a.png"), "A");
+  writeFileSync(join(session.cwd, "media", "b.png"), "B");
+  session.run = async () => "两个。\nATTACH: media/a.png\nATTACH: media/b.png";
+  const multi = await agent.chat(message("拿两个"));
+  assert.equal(multi.media.url, realpathSync(join(session.cwd, "media", "a.png")));
+  assert.equal(multi.text, "两个。");
+  assert.equal(dropped(), 1);
+  await agent.close();
+});
+
+test("B4 ATTACH containment follows symlinks (realpath); broken links fall to unreadable", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  await agent.chat(message("warmup"));
+  const session = f.sessions[0];
+  mkdirSync(join(session.cwd, "media"), { recursive: true });
+  const outside = join(f.dataDir, "outside-secret.txt");
+  writeFileSync(outside, "S");
+  const rejected = () => f.logs.filter(line => line.includes("category=attach-rejected")).length;
+
+  // A symlink inside media/ pointing at a real file outside the workspace.
+  symlinkSync(outside, join(session.cwd, "media", "escape.png"));
+  session.run = async () => "拿。\nATTACH: media/escape.png";
+  let response = await agent.chat(message("拿文件"));
+  assert.equal(response.media, undefined, "symlink escaping the workspace must be rejected");
+  assert.equal(response.text, "拿。");
+  assert.equal(rejected(), 1);
+
+  // An intermediate directory symlink: media/dir -> dataDir, file reached "through" it.
+  symlinkSync(f.dataDir, join(session.cwd, "media", "dir"));
+  session.run = async () => "拿。\nATTACH: media/dir/outside-secret.txt";
+  response = await agent.chat(message("拿文件"));
+  assert.equal(response.media, undefined, "indirect symlink escape must be rejected");
+  assert.equal(rejected(), 2);
+
+  // A regular file inside the workspace still attaches, with its realpath as the url.
+  writeFileSync(join(session.cwd, "media", "real.png"), "P");
+  session.run = async () => "拿。\nATTACH: media/real.png";
+  response = await agent.chat(message("拿文件"));
+  assert.equal(response.media.url, realpathSync(join(session.cwd, "media", "real.png")));
+  assert.equal(response.media.type, "image");
+
+  // A broken symlink resolves nowhere: the existing unreadable rejection applies.
+  symlinkSync(join(f.dataDir, "gone.txt"), join(session.cwd, "media", "broken.png"));
+  session.run = async () => "拿。\nATTACH: media/broken.png";
+  response = await agent.chat(message("拿文件"));
+  assert.equal(response.media, undefined);
+  assert.ok(f.logs.some(line => line.includes("category=attach-rejected reason=unreadable")));
+  assert.ok(!f.logs.join("\n").includes(outside), "no outside path leaks into logs");
+  await agent.close();
+});
+
+test("B4 ATTACH composes with MEMORY_SAVED: both stripped, claim verified, file attached", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  await agent.chat(message("warmup"));
+  const session = f.sessions[0];
+  const workspace = session.cwd;
+  mkdirSync(join(workspace, "media"), { recursive: true });
+  writeFileSync(join(workspace, "media", "chart.png"), "PNG");
+  session.run = async () => {
+    writeFileSync(join(workspace, "MEMORY.md"), "- 用户喜欢图表\n");
+    return "已记住并生成图表。\nMEMORY_SAVED: 用户喜欢图表\nATTACH: media/chart.png";
+  };
+  const response = await agent.chat(message("记住我喜欢图表并画一张"));
+  assert.equal(response.text, "已记住并生成图表。");
+  assert.ok(!response.text.includes("MEMORY_SAVED"));
+  assert.ok(!response.text.includes("记忆保存未能确认"));
+  assert.equal(response.media.url, realpathSync(join(workspace, "media", "chart.png")));
+  // Wrong order (ATTACH before MEMORY_SAVED) keeps the claim handling intact; the
+  // attach line is simply not trailing and is delivered as ordinary text.
+  session.run = async () => {
+    writeFileSync(join(workspace, "MEMORY.md"), "- 用户喜欢图表2\n");
+    return "已更新。\nATTACH: media/chart.png\nMEMORY_SAVED: 用户喜欢图表2";
+  };
+  const swapped = await agent.chat(message("再记一次并附图"));
+  assert.equal(swapped.text, "已更新。\nATTACH: media/chart.png");
+  assert.equal(swapped.media, undefined);
+  await agent.close();
+});
+
+test("B4 parseAttachLines and attachMediaType units", () => {
+  assert.deepEqual(parseAttachLines("好的。\nATTACH: media/a.png"), { paths: ["media/a.png"], stripped: "好的。" });
+  assert.deepEqual(parseAttachLines("好的。\n- ATTACH: media/a.png\n\n"), { paths: ["media/a.png"], stripped: "好的。" });
+  assert.deepEqual(parseAttachLines("ATTACH: media/a.png\nATTACH: media/b.png"), { paths: ["media/a.png", "media/b.png"], stripped: "" });
+  // Mentioning the marker in prose is not an attach; a bare marker with no path is not either.
+  const prose = "用法：ATTACH: 路径 表示附件。";
+  assert.deepEqual(parseAttachLines(prose), { paths: [], stripped: prose });
+  assert.deepEqual(parseAttachLines("ATTACH:"), { paths: [], stripped: "ATTACH:" });
+  assert.deepEqual(parseAttachLines("没有附件"), { paths: [], stripped: "没有附件" });
+  assert.equal(attachMediaType("media/a.JPG"), "image");
+  assert.equal(attachMediaType("media/a.webp"), "image");
+  assert.equal(attachMediaType("media/a.mov"), "video");
+  assert.equal(attachMediaType("media/a.MP4"), "video");
+  assert.equal(attachMediaType("media/a.pdf"), "file");
+  assert.equal(attachMediaType("media/noext"), "file");
 });
 
 test("state persistence failure disables authorization instead of allowing an in-memory owner", async t => {
@@ -626,7 +925,7 @@ test("A1 existing AGENTS.md is never overwritten and logs a migration note", asy
   writeFileSync(join(cwd, "AGENTS.md"), custom);
   await agent.chat(message("hello"));
   assert.equal(readFileSync(join(cwd, "AGENTS.md"), "utf8"), custom, "existing instructions must not be rewritten");
-  assert.ok(f.logs.some(line => line.includes("predates the memory-index template")));
+  assert.ok(f.logs.some(line => line.includes("differs from the current template")));
   await agent.close();
 });
 
