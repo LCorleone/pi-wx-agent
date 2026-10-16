@@ -1,0 +1,16 @@
+# dependencies & build
+node_modules/
+dist/
+
+# local runtime state (WeChat login tokens, per-user cwd, MEMORY, session map, allowlist)
+data/
+config.json
+
+# internal working docs (issue tracking, research, plans) — not part of the public product
+dev-log/
+.issues
+
+# misc
+*.log
+.env
+.DS_Store
