@@ -1,0 +1,31 @@
+# EXAMPLE ONLY: edit User, Group, WorkingDirectory, HOME, PATH and ExecStart.
+# Use the same dedicated non-root account and Pi configuration as manual onboarding.
+[Unit]
+Description=Pi WeChat personal assistant
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=piwx
+Group=piwx
+WorkingDirectory=/srv/pi-wx-agent
+Environment=HOME=/home/piwx
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Optional protected environment file for provider keys (not committed):
+# EnvironmentFile=/etc/pi-wx-agent.env
+# Optional alternative Pi directory; include it in your backups:
+# Environment=PI_CODING_AGENT_DIR=/home/piwx/.pi/agent
+ExecStart=/usr/bin/node /srv/pi-wx-agent/dist/main.js start --config /srv/pi-wx-agent/config.json
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=15
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

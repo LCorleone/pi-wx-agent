@@ -1,131 +1,82 @@
-# pi-wx-agent 设计（v1）
+# pi-wx-agent v1：实际实现
 
-一套最小可用的个人 AI 助理：把 pi coding agent 桥接到微信，扫码即用。原则：最简实现，能用官方/SDK 原生能力就不写代码。
+## 架构与边界
 
-## 1. 架构
-
-```
-微信 ←(官方API/长轮询)→ weixin-agent-sdk
-                            ↓ Agent.chat()
-                       PiAgent（本项目唯一核心类）
-                            ↓
-              pi SDK createAgentSession（每 conversationId 一个）
-```
-
-## 2. 文件结构
-
-```
-pi-wx-agent/
-├── package.json          # deps: weixin-agent-sdk + pi SDK
-├── tsconfig.json
-├── config.example.json   # 用户复制为 config.json 后填配置
-├── .gitignore            # 忽略 node_modules/ dist/ data/ config.json
-├── LICENSE               # MIT
-├── src/main.ts           # login() → start(piAgent)
-├── src/pi-agent.ts       # 白名单 + 会话映射 + prompt 封装（核心 ~100 行）
-├── pi-wx-agent.service   # systemd（示例，README 指引安装）
-└── README.md             # 快速开始：从 clone 到微信收到回复
+```text
+微信 API ← 长轮询 → weixin-agent-sdk@0.5.0
+                         ↓ chat / clearSession
+                     PiAgent 共享 FIFO
+                  ↙ chat  ↓ clear  ↘ dream
+               createAgentSession（Pi SDK 1.3.0）
+                      ↓ Pi 自管 JSONL
 ```
 
-两个源文件，一个核心类，没有抽象层。
+微信 SDK 原生全局串行，但定时 dream 与同步 clear 回调不在同一异步生命周期，桥接必须共享一个 FIFO。只支持一个 owner、文本回复，不引 cron 库/数据库/外部模型提取管道。
 
-## 3. 核心流程
+模块：`main.ts` 管配置/微信登录/停止/定时器；`config.ts` 校验配置；`state.ts` 管可验证的原子持久状态；`pi-agent.ts` 管认领/串行生命周期/记忆规则/dream；`pi-session.ts` 适配并验证真实 Pi API。没有全局安装依赖。
 
-**启动**：读 config → `login()`（首次扫码）→ `start(piAgent)`。
+## 启动与 owner
 
-**收到消息 chat(request)**：
+1. 读配置，dataDir 相对配置文件解析为绝对路径，umask 077。
+2. 在动态导入微信 SDK **之前**设置 `OPENCLAW_STATE_DIR=dataDir`。
+3. start 校验 Pi 模型配置/可用认证，不执行付费 prompt；首次交互式扫码，后续复用登录。后台无登录直接报错。
+4. 没有 owner 且没有旧认领状态时创建随机 128-bit 码。只打印一次；状态仅存 hash、10 分钟到期时间、全局 5 次尝试预算。
+5. 认领成功先原子写 owner 哈希/删除认领码，再回复成功，不调用 Pi。重启不刷新预算；本地 `claim` 可显式轮换未认领窗口，不可替换 owner。
+6. 未授权 chat 返回「未授权」，clear 同步抛出「未授权」供 SDK 捕获；二者都不创建/恢复/运行 Pi。写入错误禁用当前桥接，损坏状态拒绝启动，不自动重置授权。
 
-1. 白名单检查：conversationId 不在 allowlist → 回「未授权」，结束。
-2. 取会话：Map 里没有就恢复/新建 `createAgentSession({ cwd: data/<conversationId>/ })`。
-3. `session.isStreaming ? followUp(text) : prompt(text)`（pi 原生队列；流式时不带 streamingBehavior 调 prompt 会 throw）。
-4. 回 `{ text: getLastAssistantText() }`。
-5. 整个 chat() 包 try/catch：出错回一句错误提示，绝不向上抛（SDK 侧也有兜底，双保险）。
+一个 dataDir 只允许一个进程；没有跨进程锁。`claim/login` 必须停服务后执行。显式 `login` 清 SDK 账号凭据并重新扫码，不清 owner/会话。SDK 没有导出 adequate pairing API，因此自实现有限认领。
 
-**/clear（clearSession）**：dispose 会话 + 从 Map 和映射文件删 id。cwd 不删 → 记忆保留，下一条消息开新会话。
+## chat 与 clear
 
-**唯一必要胶水**：conversationId → pi sessionId 映射文件（`data/sessions.json`）。pi 会话文件懒创建，首条 prompt 完成后落盘 sessionId；重启后 `SessionManager.findById(cwd, id)` + `open(path)` 恢复。
+授权后 chat 入 FIFO，读取/新建 `dataDir/conversations/<sha256(conversationId)>`，不以原始 ID 拼路径。首次写项目自有 `AGENTS.md`（已有文件不覆盖）。
 
-## 4. 自动压缩（零代码）
+持久映射使用 UUID intent：在 Pi 首次 prompt 前写 `state.json`；通过 `SessionManager.create(cwd, undefined, {id})` 创建相同 UUID。Pi 首个 user message 即创建 JSONL，不必等 assistant。恢复使用 `SessionManager.findById(cwd,id)` 和 `open(path,undefined,cwd)`，验证 ID；没有文件且未完成首轮时可用同一 ID 重建空 intent；已成功运行后文件缺失必须报错，不能偷偷续最近或开新会话。
 
-pi 内置 auto-compact 默认开启（`compaction.enabled` 默认 true，reserve 16384 / keepRecent 20000）。本项目不写任何压缩逻辑。
+每轮记录持久 activity 计数，再等待 idle session 的 `prompt()` 完整执行。不调用 `followUp()` 充当同步执行：它只承诺排队/消费，不承诺对应回复完成。只接受本轮 `message_end` 的新 assistant 最终成功文本（stopReason=stop），不取可能属于之前 dream/失败 run 的 `getLastAssistantText()`。失败返回通用提示，避免向微信泄漏原始异常。
 
-## 5. 自动记忆（零管道）
+clear 同步鉴权并递增代际编号，使尚未返回的旧 chat 回复/旧排队请求失效，然后在 FIFO 内持久删除映射、dispose。后续 chat 排在 clear 后新建 UUID。工作目录/MEMORY 和旧 JSONL 不删。SDK 的 clear 回调不 await，因此微信自带成功提示可能先于磁盘清理；这不是完整事务确认。持久失败禁用当前 bridge 并记录日志。
 
-pi 默认把 cwd 下的 AGENTS.md 注入上下文，记忆规则直接写在 AGENTS.md 里，不需要任何额外 API。
+关闭时阻止新任务，取消定时器/轮询，abort、等待队列、dispose；10 秒进程退出上限。已发送给微信 SDK 的回复不可撤销；SDK 实际串行派发确保网络发送与下一条收到的 clear 有序。
 
-1. 每会话独立 cwd：`data/<conversationId>/`，首次创建时写入预置 AGENTS.md。
-2. AGENTS.md 预置内容：助理人设 + 两条规则——「跨会话有用的事实（偏好、约定、日程）追加写入本目录 MEMORY.md」「需要回忆用户信息时先读 MEMORY.md」。
-3. pi 用自带 edit 工具自己维护 MEMORY.md。
-4. 效果：压缩/清会话/重启后，事实仍在（MEMORY.md 在磁盘上）。
+## 原生压缩与记忆
 
-不建：LLM 提取管道、向量库、记忆中间件。
+`SettingsManager.applyOverrides({compaction:{enabled:true}})` **在 createAgentSession 完成后**执行；安装版本的 ResourceLoader.reload 会重载并丢弃提前设置的 overrides。立即检查 `session.autoCompactionEnabled`。不修改操作员全局设置，不另写摘要算法；阈值和摘要的正确性依赖 Pi/model。
 
-### Dream：夜间反思（~20 行）
+Pi 原生加载 cwd/父目录/agentDir 的 AGENTS 类 context 文件。项目的通用模板只要求：每轮先读 MEMORY.md，长期有用的确认事实用 read/write/edit 保存、纠错、去重；不记录秘密，实际检查写入，不凭空承诺保存。
 
-1. config：`"dream": { "enabled": true, "hour": 3 }`。
-2. 进程内 setInterval 每小时检查（不引 cron 库）。
-3. 到点对**当天活跃过**的每个会话：非 streaming 时 `followUp("【例行反思】回顾今天的对话，把值得长期记住的事实更新进 MEMORY.md：新增、修正、删过时条目，然后一句话确认。")`。
-4. agent 在主会话上下文内反思（当天对话已在上下文，无需搬数据），用 edit 工具改 MEMORY.md；回复文本丢弃。
-5. streaming 中则跳过，明晚再来。
+MEMORY 是磁盘文件，不是额外 LLM 提取流程；模型是否正确读写不保证。压缩/clear 不删文件；原始 JSONL/备份可能仍含已要求忘记的内容。分发模板不包含任何部署者私人指令。
 
-白天 agent「自觉」记，晚上 dream 兜底整理——把碎片事实合并、删过时的，MEMORY.md 不会越长越烂。
+## Dream 调度
 
-## 6. 白名单引导（owner 认领，开箱即用的关键）
+配置 `{enabled,hour}`；本地时区每日 hour，启动及每分钟检查。每会话持久记录：
 
-随机 OWNER_CODE 方案（~25 行）：
+- `activity`：聊天活动计数；
+- `reflectedActivity`：上次成功反思覆盖的活动计数；
+- `pendingSince`：第一条尚未覆盖的活动时间；
+- `lastDreamSuccess`：成功运行的完成时间。
 
-1. 首次启动生成 6 位随机码，打进控制台日志。
-2. 部署者在微信里给 bot 发送这个码。
-3. bot 校验后把该 conversationId 写入 `data/allowlist.json`，回复「认领成功」。
-4. 之后其他陌生人发消息 → 回「未授权」。
+有未覆盖活动时，从 `pendingSince` 后的下一次 hour 开始到期；使用本地日历运算（不是 UTC date 字符串或固定“今天”筛选）。因此前一晚活动可以凌晨处理，忙时/离线错过后仍到期，成功后不因重启重复。
 
-无需改配置重启。allowlist 运行时可变，config.json 只放静态配置。
+若 FIFO 忙，暂不加入 dream，下分钟重试；idle 会话在 FIFO 内真正 `await prompt(DREAM_PROMPT)`。反思读 MEMORY 并只整理当前可见上下文，不能恢复已压缩原文。成功后标记覆盖的 activity，文本永不发微信。失败不更新成功标记，后续重试；run 成功不证明 MEMORY 写入质量。模型完成到状态落盘间崩溃可能重复，非 exactly-once。清理与反思完全串行，dream 不污染回复选择。
 
-## 7. 配置与数据
+## 存储与部署
 
-```json
-{
-  "dataDir": "./data",
-  "model": null,
-  "dream": { "enabled": true, "hour": 3 }
-}
+```text
+<resolved dataDir>/
+  openclaw-weixin/             # 微信 SDK 的真实子树，不是 openclaw/
+  state.json                  # owner、认领、UUID 映射和 dream 状态
+  conversations/<hash>/       # cwd / AGENTS.md / MEMORY.md
+<service HOME>/.pi/agent/
+  sessions/<encoded-cwd>/...jsonl   # 默认外部 Pi 会话位置
+  auth.json / models.json / settings.json / ...
 ```
 
-全部运行态收在一个 `data/` 目录（进程启动时设 `OPENCLAW_STATE_DIR` 指向它）：
+`PI_CODING_AGENT_DIR` 可改 Pi 根。完整备份还需配置和私有环境变量；只备份 data 不够。恢复默认保持 dataDir 绝对路径，以维持 Pi cwd 编码目录；迁移路径必须人工核对。状态写同目录临时文件、fsync、rename、目录 fsync；文件 600，目录 700。没有承诺横跨 Pi JSONL 与 bridge JSON 的分布式事务。
 
-```
-data/
-├── openclaw/…      # 微信登录态（token，gitignore 保护）
-├── allowlist.json  # 白名单
-├── sessions.json   # conversationId→sessionId 映射
-└── <wxid>/         # 每个用户的专属 cwd：AGENTS.md + MEMORY.md
-```
+systemd 仅提供可编辑非 root 示例，不自动安装；先手动认证/扫码/认领。Pi 能执行 shell，cwd 不是沙箱，默认全局资源会被原生发现。SDK 会在桥接授权之前处理 echo/debug 和下载附件；不调用 Pi 但有 I/O/日志风险。v1 不做媒体模型、主动推送、多个 owner、沙箱或持久消息重投队列。
 
-仓库外只有：`~/.pi/`（pi 本体配置与模型认证，前置条件）和 `~/.pi/agent/sessions/`（pi 会话文件，pi 自管）。备份/搬家整个 bot = 拷贝本目录（含 data/）。
+## 验证边界
 
-## 8. 部署
+离线测试覆盖 fake session/clock/temp dir 下的授权、一次性码预算、故障拒绝、路径、精确恢复/clear、并发、午夜/离线/忙/失败 dream、关闭和新鲜回复识别；额外实际安装 SDK 测试只在隔离临时 HOME/agentDir 构建会话/JSONL、不 prompt，验证 AGENTS 注入、UUID 恢复和压缩开关。
 
-1. `npm run build`
-2. 手动 `node dist/main.js` 跑一次 → 扫码 → 登录态落盘
-3. `systemctl enable --now pi-wx-agent`（Restart=always；SDK 自带断线重连）
-
-## 9. 不做（v1 明确出界）
-
-媒体收发、流式分片、多用户管理界面、RAG、记忆提取管道、Docker/compose（pi 配置在 ~/.pi，容器化徒增复杂度；README 说明 Node 22 裸跑 + systemd）。
-
-## 10. 关键技术事实（已对源码验证）
-
-| # | 结论 | 出处 |
-|---|------|------|
-| 1 | pi SDK auto-compact 默认开启 | pi docs `compaction.md`（`compaction.enabled` 默认 true） |
-| 2 | AGENTS.md 默认自动注入 cwd 及父目录 | pi docs `configuration.md`；SDK `DefaultResourceLoader` |
-| 3 | 会话可按 id 恢复 | `SessionManager.findById(cwd, id)` + `SessionManager.open(path)` |
-| 4 | 流式中 prompt 不带 streamingBehavior 会 throw | `AgentSession.prompt()` docstring；用 `session.isStreaming` 预检 |
-| 5 | weixin-agent-sdk@0.5.0：npm 包，node>=22，消息循环全局串行、chat() 抛错 SDK 兜底、`/clear` 内置触发 clearSession、断线自动重试 | github.com/wong2/weixin-agent-sdk 源码 |
-| 6 | 微信账号过期（errcode -14）需重新扫码 | SDK `session-guard.ts` |
-
-## 11. 开箱即用验收
-
-1. 陌生人视角：`git clone` → `npm install && npm run build` → 复制 config.example.json → `node dist/main.js` 扫码 → 发 OWNER_CODE → 微信收到 pi 回复。全程只看 README。
-2. 仓库里无任何个人数据硬编码；登录态/会话/白名单全部在 .gitignore 的 data/ 与 config.json 内。
-3. README 含：快速开始、白名单与安全警告（pi 能执行 shell，只认领自己）、systemd 部署、已知限制（全局串行、errcode -14）、常见问题。
+人工验收仍必需：微信 QR/真实文字往返、真实长上下文自动压缩、MEMORY 写入/读取质量、真实 dream 后文件变化及无微信反思回复。详见 README。

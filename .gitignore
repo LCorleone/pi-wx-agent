@@ -10,6 +10,9 @@ config.json
 dev-log/
 .issues
 
+# local agent runtime artifacts
+.pi/subagents/
+
 # misc
 *.log
 .env

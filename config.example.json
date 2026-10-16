@@ -1,0 +1,8 @@
+{
+  "dataDir": "./data",
+  "model": null,
+  "dream": {
+    "enabled": true,
+    "hour": 3
+  }
+}
