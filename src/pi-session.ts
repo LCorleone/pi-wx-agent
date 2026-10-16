@@ -4,7 +4,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { Config } from "./config.js";
 import { AssistantResponseError, MissingMappedSessionError } from "./diagnostics.js";
-import type { BridgeSession, SessionFactory } from "./pi-agent.js";
+import type { BridgeSession, SessionFactory, SessionIntrospection } from "./pi-agent.js";
 
 /** Only completed assistant events from THIS prompt may become a WeChat reply. */
 export function wrapSession(session: AgentSession): BridgeSession {
@@ -27,6 +27,14 @@ export function wrapSession(session: AgentSession): BridgeSession {
       } finally { unsubscribe(); }
     },
     abort: () => session.abort(),
+    compact: instructions => session.compact(instructions),
+    introspect: (): SessionIntrospection => ({
+      model: session.model ? { provider: session.model.provider, id: session.model.id, contextWindow: session.model.contextWindow } : undefined,
+      thinkingLevel: session.thinkingLevel,
+      isIdle: session.isIdle,
+      stats: session.getSessionStats(),
+      contextUsage: session.getContextUsage(),
+    }),
     dispose: () => session.dispose(),
   };
 }

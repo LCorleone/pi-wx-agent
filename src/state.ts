@@ -9,6 +9,8 @@ export interface Conversation {
   reflectedActivity: number;
   pendingSince: number;
   lastDreamSuccess: number;
+  /** When the last dream ATTEMPT started (success or failure); 0 before the first attempt. */
+  lastDreamAttempt: number;
 }
 export interface State {
   version: 1;
@@ -30,10 +32,13 @@ export function readState(dataDir: string): State {
       !s.conversations || typeof s.conversations !== "object" || Array.isArray(s.conversations) ||
       Object.entries(s.conversations).some(([key, c]) => !/^[a-f0-9]{64}$/.test(key) || key !== s.owner ||
         !c || typeof c.sessionId !== "string" || !/^[a-f0-9-]{36}$/.test(c.sessionId) || typeof c.started !== "boolean" ||
-        ![c.activity, c.reflectedActivity, c.pendingSince, c.lastDreamSuccess].every(isTime) || c.reflectedActivity > c.activity) ||
+        ![c.activity, c.reflectedActivity, c.pendingSince, c.lastDreamSuccess].every(isTime) ||
+        !(c.lastDreamAttempt === undefined || isTime(c.lastDreamAttempt)) || c.reflectedActivity > c.activity) ||
       (s.owner !== null && s.claim !== null)) {
     throw new Error("Invalid state.json; refusing to reset authorization or sessions. Restore a backup.");
   }
+  // Additive v2 field: accept pre-v2 state.json files and default the missing marker to 0.
+  for (const c of Object.values(s.conversations)) if (c.lastDreamAttempt === undefined) c.lastDreamAttempt = 0;
   return s;
 }
 
