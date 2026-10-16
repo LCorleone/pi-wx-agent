@@ -3,8 +3,8 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { PiAgent, dreamDueAt, DREAM_PROMPT, MEMORY_INSTRUCTIONS, parseCommand, parseSavedClaims, REMEMBER_INTENT } from "../dist/pi-agent.js";
-import { indexLineCount, readMemoryStore, MEMORY_INDEX_MAX_LINES } from "../dist/memory.js";
+import { PiAgent, dreamDueAt, DREAM_PROMPT, MEMORY_INSTRUCTIONS, parseCommand, parseSavedClaims, REMEMBER_INTENT, REMEMBER_INTENT_EN } from "../dist/pi-agent.js";
+import { indexLineCount, readMemoryStore, sameMemoryStore, MEMORY_INDEX_MAX_LINES } from "../dist/memory.js";
 import { hash, readState } from "../dist/state.js";
 import { loadConfig } from "../dist/config.js";
 import { AssistantResponseError, MissingMappedSessionError } from "../dist/diagnostics.js";
@@ -381,18 +381,35 @@ test("A2 memory write verification: chat verifies MEMORY_SAVED markers and strip
   assert.ok(!response.text.includes("MEMORY_SAVED"));
   assert.equal(flagged(), 0);
 
-  // Failure: the claim is absent from index and topic files.
+  // Rewrite of an EXISTING fact: the claimed line text existed before, but the model
+  // edited the store during the run, so the claim verifies.
+  session.run = async () => {
+    writeFileSync(join(workspace, "MEMORY.md"), "# index\n- 用户喜欢黑咖啡（加燕麦奶）\n");
+    return "好的，已更正。\nMEMORY_SAVED: 用户喜欢黑咖啡";
+  };
+  response = await agent.chat(message("其实我喜欢黑咖啡加燕麦奶"));
+  assert.equal(response.text, "好的，已更正。");
+  assert.equal(flagged(), 0);
+
+  // Failure: the claim is absent from index and topic files (store unchanged).
   session.run = async () => "已保存。\nMEMORY_SAVED: 用户的生日是 1 月 1 日";
   response = await agent.chat(message("记住我的生日"));
   assert.match(response.text, /记忆保存未能确认/);
   assert.ok(!response.text.includes("MEMORY_SAVED"));
   assert.equal(flagged(), 1);
 
-  // Re-asking to remember an EXISTING fact (no new write) does not count as a write.
+  // Re-asking to remember an EXISTING fact while the model writes NOTHING (store
+  // unchanged) does not count as a write.
   session.run = async () => "好的，已记下。\nMEMORY_SAVED: 用户喜欢黑咖啡";
   response = await agent.chat(message("记住我喜欢黑咖啡"));
   assert.match(response.text, /记忆保存未能确认/);
   assert.equal(flagged(), 2);
+
+  // Fabricated claim with an unchanged store is unverified.
+  session.run = async () => "好的。\nMEMORY_SAVED: 用户明天要去上海";
+  response = await agent.chat(message("随便聊聊"));
+  assert.match(response.text, /记忆保存未能确认/);
+  assert.equal(flagged(), 3);
 
   // The detail may live in a topic file written during the run.
   session.run = async () => {
@@ -403,7 +420,7 @@ test("A2 memory write verification: chat verifies MEMORY_SAVED markers and strip
   response = await agent.chat(message("再记一次生日"));
   assert.equal(response.text, "已保存。");
   assert.ok(!response.text.includes("记忆保存未能确认"));
-  assert.equal(flagged(), 2);
+  assert.equal(flagged(), 3);
 
   // Explicit "remember this" with no marker at all is treated as unconfirmed.
   session.run = async () => "好的。";
@@ -448,7 +465,9 @@ test("A2/A3 dream verification: unverified writes keep activity due; verified wr
   // Missed dream is detectable: an attempt newer than the last success.
   assert.ok(record.lastDreamAttempt > record.lastDreamSuccess);
 
-  // Retry with a real write DURING the run: now success is recorded and activity is covered.
+  // Retry with a real write DURING the run. An unverified attempt gates the next run to
+  // the next daily boundary after that attempt, so advance the clock past 9/17 03:00.
+  f.setNow(new Date(2026, 9, 17, 3, 1).getTime());
   session.run = async () => {
     writeFileSync(join(session.cwd, "MEMORY.md"), "- 用户偏好简洁回复\n");
     return "已整理。\nMEMORY_SAVED: 用户偏好简洁回复";
@@ -465,7 +484,8 @@ test("A2/A3 dream verification: unverified writes keep activity due; verified wr
   await agent.dream();
   assert.equal(session.calls.length, calls);
 
-  // A crash between attempt and success (attempt recorded, success not) is retried.
+  // A caught (transient) error keeps the per-minute retry: the unresolved-attempt
+  // marker is cleared so the very next tick runs again instead of waiting a day.
   agent.clearSession("owner");
   await agent.drain();
   f.setNow(new Date(2026, 9, 17, 2).getTime());
@@ -475,9 +495,9 @@ test("A2/A3 dream verification: unverified writes keep activity due; verified wr
   second.run = async () => { throw new Error("boom"); };
   await agent.dream();
   record = f.state().conversations[key];
-  assert.ok(record.lastDreamAttempt > record.lastDreamSuccess);
+  assert.equal(record.lastDreamAttempt, record.lastDreamSuccess, "transient error clears the gate");
   second.run = async () => "no changes";
-  await agent.dream();
+  await agent.dream(); // Same tick retries immediately (per-minute semantics preserved).
   record = f.state().conversations[key];
   assert.equal(record.reflectedActivity, record.activity);
   assert.equal(record.lastDreamSuccess, f.now);
@@ -488,6 +508,111 @@ test("A2/A3 dream verification: unverified writes keep activity due; verified wr
   delete raw.conversations[key].lastDreamAttempt;
   writeFileSync(join(f.dataDir, "state.json"), `${JSON.stringify(raw, null, 2)}\n`);
   assert.equal(readState(f.dataDir).conversations[key].lastDreamAttempt, 0);
+});
+
+test("P1 dream-style rewrite verifies when the store changed even though the claim text pre-existed", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  await agent.chat(message("facts"));
+  const session = f.sessions[0];
+  const key = hash("owner");
+  // Seed an existing index line whose text is what the dream will claim.
+  writeFileSync(join(session.cwd, "MEMORY.md"), "- 用户喜欢拿铁\n");
+  f.setNow(new Date(2026, 9, 16, 4).getTime());
+  // Dream migrates the detail into a topic file; the index line text is unchanged.
+  session.run = async () => {
+    mkdirSync(join(session.cwd, "memory"), { recursive: true });
+    writeFileSync(join(session.cwd, "memory", "coffee.md"), "用户喜欢拿铁（不加糖）\n");
+    return "已整理。\nMEMORY_SAVED: 用户喜欢拿铁";
+  };
+  await agent.dream();
+  const record = f.state().conversations[key];
+  assert.equal(record.reflectedActivity, record.activity, "store changed -> verified -> activity covered");
+  assert.equal(record.lastDreamSuccess, f.now);
+  assert.ok(!f.logs.some(line => line.includes("Dream memory write unverified")));
+  await agent.close();
+});
+
+test("P3a over-cap index is reported on a tidy-only dream (no claims, no store change)", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  await agent.chat(message("facts"));
+  const session = f.sessions[0];
+  const lines = Array.from({ length: MEMORY_INDEX_MAX_LINES + 1 }, (_, n) => `- fact ${n}`);
+  writeFileSync(join(session.cwd, "MEMORY.md"), `${lines.join("\n")}\n`);
+  f.setNow(new Date(2026, 9, 16, 4).getTime());
+  session.run = async () => "已检查，无需改动。"; // No claims, no write.
+  await agent.dream();
+  assert.ok(f.logs.some(line => line.includes("category=memory-index-over-cap")), "cap must surface even without writes");
+  await agent.close();
+});
+
+test("item4 unverified dream gates the next run to the next daily boundary", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  await agent.chat(message("facts"));
+  const session = f.sessions[0];
+  const key = hash("owner");
+  let dreamRuns = 0;
+  // First dream at 04:00 fails verification (claims a fact it never wrote).
+  f.setNow(new Date(2026, 9, 16, 4).getTime());
+  session.run = async text => {
+    if (text === DREAM_PROMPT) { dreamRuns++; return "已整理。\nMEMORY_SAVED: 从未写入的事实"; }
+    return `reply:${text}`;
+  };
+  await agent.dream();
+  assert.equal(dreamRuns, 1);
+  const record = f.state().conversations[key];
+  assert.ok(record.lastDreamAttempt > record.lastDreamSuccess);
+  // New same-day chat activity must NOT bypass the backoff gate (guards against a revert
+  // to pendingSince-only due derivation, which would re-run here).
+  f.setNow(new Date(2026, 9, 16, 4, 1).getTime());
+  await agent.chat(message("more same-day facts"));
+  assert.equal(dreamRuns, 1, "chat activity does not bypass the backoff gate");
+  // Subsequent ticks the same day must NOT re-run the model.
+  await agent.dream();
+  f.setNow(new Date(2026, 9, 16, 12).getTime());
+  await agent.dream();
+  assert.equal(dreamRuns, 1, "no re-run before the next daily boundary");
+  // Past the next daily boundary (9/17 03:00), it runs again.
+  f.setNow(new Date(2026, 9, 17, 3, 1).getTime());
+  await agent.dream();
+  assert.equal(dreamRuns, 2, "re-runs after the next daily boundary");
+  await agent.close();
+});
+
+test("item6 over-cap is logged on the unverified-continue path too", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  await agent.chat(message("facts"));
+  const session = f.sessions[0];
+  const lines = Array.from({ length: MEMORY_INDEX_MAX_LINES + 1 }, (_, n) => `- fact ${n}`);
+  writeFileSync(join(session.cwd, "MEMORY.md"), `${lines.join("\n")}\n`);
+  f.setNow(new Date(2026, 9, 16, 4).getTime());
+  // Unverifiable claim (no store change) so the dream hits the unverified `continue`.
+  session.run = async () => "已整理。\nMEMORY_SAVED: 从未写入的事实";
+  await agent.dream();
+  assert.ok(f.logs.some(line => line.includes("Dream memory write unverified")), "unverified path taken");
+  assert.ok(f.logs.some(line => line.includes("category=memory-index-over-cap")), "cap logged before the continue");
+  await agent.close();
+});
+
+test("item6 sameMemoryStore: changed on add/delete/rename/whitespace; stable and order-insensitive", t => {
+  const base = { index: "- a\n- b\n", topics: { "a.md": "A", "b.md": "B" } };
+  const clone = { index: "- a\n- b\n", topics: { "b.md": "B", "a.md": "A" } };
+  assert.equal(sameMemoryStore(base, clone), true, "identical store, order-insensitive topic names");
+  assert.equal(sameMemoryStore(base, { index: "- a\n- b\n- c\n", topics: base.topics }), false, "index add");
+  assert.equal(sameMemoryStore(base, { index: "- a\n", topics: base.topics }), false, "index delete");
+  assert.equal(sameMemoryStore(base, { index: "- a\n- b \n", topics: base.topics }), false, "index whitespace");
+  assert.equal(sameMemoryStore(base, { index: base.index, topics: { "a.md": "A", "b.md": "B", "c.md": "C" } }), false, "topic add");
+  assert.equal(sameMemoryStore(base, { index: base.index, topics: { "a.md": "A" } }), false, "topic delete");
+  assert.equal(sameMemoryStore(base, { index: base.index, topics: { "renamed.md": "A", "b.md": "B" } }), false, "topic rename");
+  assert.equal(sameMemoryStore(base, { index: base.index, topics: { "a.md": "A ", "b.md": "B" } }), false, "topic whitespace");
+  assert.equal(sameMemoryStore({ index: null, topics: {} }, { index: null, topics: {} }), true, "both empty");
 });
 
 test("A1 existing AGENTS.md is never overwritten and logs a migration note", async t => {
@@ -585,12 +710,20 @@ test("A2 marker parsing strips only a trailing anchored marker block", t => {
   assert.deepEqual(parseSavedClaims("MEMORY_SAVED:"), { claims: [], stripped: "MEMORY_SAVED:" });
 });
 
-test("P2-1 REMEMBER_INTENT requires an imperative + object form", t => {
-  for (const text of ["请记住这件事", "记住我的偏好", "记下：我住在杭州", "记一下这", "remember this", "Remember that I like tea"]) {
-    assert.equal(REMEMBER_INTENT.test(text), true, `should match: ${text}`);
+test("P2-1 REMEMBER_INTENT matches line-anchored imperative phrasings", t => {
+  const hit = text => REMEMBER_INTENT.test(text) || REMEMBER_INTENT_EN.test(text);
+  for (const text of ["记住我喜欢黑咖啡", "帮我记住明天开会", "请记住这件事", "记住：会议改到3点", "记一下这", "记下：我住在杭州"]) {
+    assert.equal(hit(text), true, `CN should match: ${text}`);
   }
   for (const text of ["你能记住多少条记忆？", "好的，我记住了", "我记下了你的建议", "你记住了吗", "今天天气不错"]) {
-    assert.equal(REMEMBER_INTENT.test(text), false, `should not match: ${text}`);
+    assert.equal(hit(text), false, `CN should not match: ${text}`);
+  }
+  // Shipped English pattern is anchored: imperative matches, descriptive does not.
+  for (const text of ["remember this", "Please remember my address", "Remember that I like tea"]) {
+    assert.equal(REMEMBER_INTENT_EN.test(text), true, `EN should match: ${text}`);
+  }
+  for (const text of ["I remember this song", "I do remember that day", "do you remember this?"]) {
+    assert.equal(REMEMBER_INTENT_EN.test(text), false, `EN should not match: ${text}`);
   }
 });
 

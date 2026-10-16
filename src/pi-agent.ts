@@ -5,7 +5,7 @@ import type { Agent, ChatRequest, ChatResponse } from "weixin-agent-sdk";
 import type { CompactionResult, ContextUsage, SessionStats } from "@earendil-works/pi-coding-agent";
 import type { Config } from "./config.js";
 import { safeDiagnostic } from "./diagnostics.js";
-import { factInStore, indexLineCount, MEMORY_INDEX_MAX_LINES, readMemoryStore, type MemoryStore } from "./memory.js";
+import { factInStore, indexLineCount, MEMORY_INDEX_MAX_LINES, readMemoryStore, sameMemoryStore, type MemoryStore } from "./memory.js";
 import { hash, readState, writeState, type Conversation, type State } from "./state.js";
 
 // Public, project-owned instructions; never copied from the operator's Pi configuration.
@@ -42,8 +42,11 @@ export const MEMORY_SAVED_MARKER = "MEMORY_SAVED:";
 /** An anchored marker line: optional indent/bullet, the marker, then non-empty claim text. */
 const SAVED_CLAIM_LINE = /^\s*[-*]?\s*MEMORY_SAVED:\s*(\S.*)$/;
 
-/** Conservative "explicit remember this" intent; requires an imperative + object form. */
-export const REMEMBER_INTENT = /(?:记住|记一下|记下)(?:这|这一|我的|以下|：|:)|remember\s+(?:this|that|my)\b/i;
+/** Conservative "explicit remember this" intent; requires a line-anchored imperative form. */
+export const REMEMBER_INTENT = /^(?:请|帮我|麻烦)?(?:记住|记一下|记下)/m;
+
+/** English alternative; line-anchored imperative so "I remember this song" does not match. */
+export const REMEMBER_INTENT_EN = /^(?:please\s+)?remember\s+(?:this|that|my)\b/im;
 
 /**
  * Split a reply into verified-write claims and the user-visible remainder.
@@ -159,14 +162,30 @@ export class PiAgent implements Agent {
   private workspace(key: string): string { return join(this.config.dataDir, "conversations", key); }
 
   /**
-   * Claims via MEMORY_SAVED that did not newly reach memory this turn: a claim is
-   * verified only when it is present AFTER the run and absent from the pre-run
-   * snapshot, so merely re-asking to remember an existing fact is not counted as a write.
+   * Claims via MEMORY_SAVED that are not backed by a real write this turn. A claim is
+   * verified when its text is present in the AFTER store AND the store changed during
+   * the run (before != after). This accepts rewrites/merges/migrations of existing
+   * facts (the claim text may predate the run) while rejecting a model that wrote
+   * nothing (store unchanged), so a read-only or fabricated claim stays unverified.
+   *
+   * Assumes a SINGLE writer per workspace: the bridge serializes all chat/clear/dream
+   * on one FIFO, so before/after straddle only this run. An external process editing
+   * the same workspace concurrently could change the store and falsely verify a
+   * pre-existing claim (it would still need the claim text present in the after store).
    */
   private unverifiedClaims(key: string, claims: string[], before: MemoryStore): string[] {
     if (!claims.length) return [];
     const after = readMemoryStore(this.workspace(key));
-    return claims.filter(fact => !factInStore(after, fact) || factInStore(before, fact));
+    if (sameMemoryStore(before, after)) return [...claims];
+    return claims.filter(fact => !factInStore(after, fact));
+  }
+
+  /** Log an over-cap index; called whenever a dream run actually executed. */
+  private reportIndexCap(key: string): void {
+    const lines = indexLineCount(readMemoryStore(this.workspace(key)).index);
+    if (lines > MEMORY_INDEX_MAX_LINES) {
+      this.log(`Memory index over cap; category=memory-index-over-cap lines=${lines} cap=${MEMORY_INDEX_MAX_LINES}.`);
+    }
   }
 
   private async session(key: string): Promise<BridgeSession> {
@@ -240,7 +259,7 @@ export class PiAgent implements Agent {
         if (generation !== this.generation || this.closing) return {};
         const { claims, stripped } = parseSavedClaims(reply);
         const missing = this.unverifiedClaims(key, claims, before);
-        const remembered = REMEMBER_INTENT.test(request.text);
+        const remembered = REMEMBER_INTENT.test(request.text) || REMEMBER_INTENT_EN.test(request.text);
         const unconfirmed = missing.length > 0 || (remembered && claims.length === 0);
         if (missing.length) {
           this.log(`Memory write unverified; category=memory-write-unverified count=${missing.length}.`);
@@ -312,7 +331,7 @@ export class PiAgent implements Agent {
       const pending = record.activity !== record.reflectedActivity;
       lines.push(`- dream: 已覆盖 ${record.reflectedActivity}/${record.activity}${pending ? "（有待处理活动）" : ""}`);
       lines.push(`- 上次 dream 成功: ${record.lastDreamSuccess ? new Date(record.lastDreamSuccess).toISOString() : "无"}`);
-      if (record.lastDreamAttempt > record.lastDreamSuccess) lines.push("- 注意: 上次 dream 尝试未成功，将在到期后重试");
+      if (record.lastDreamAttempt > record.lastDreamSuccess) lines.push("- 注意: 上次 dream 验证未通过，将在下一个每日边界重试");
     }
     const indexLines = indexLineCount(readMemoryStore(this.workspace(key)).index);
     lines.push(`- 记忆索引: ${indexLines} 行（软上限约 ${MEMORY_INDEX_MAX_LINES}${indexLines > MEMORY_INDEX_MAX_LINES ? "，已超限" : ""}）`);
@@ -360,6 +379,12 @@ export class PiAgent implements Agent {
       for (const [key, record] of Object.entries(this.state.conversations)) {
         if (this.closing || this.unhealthy || record.activity === record.reflectedActivity ||
             this.now() < dreamDueAt(record.pendingSince, this.config.dream.hour)) continue;
+        // Backoff after an UNVERIFIED attempt (lastDreamAttempt > lastDreamSuccess): wait
+        // until the next daily boundary after that attempt instead of retrying every tick.
+        // Transient provider/error failures reset the attempt marker, so they keep the
+        // per-minute retry. No new state: this reuses lastDreamAttempt/lastDreamSuccess.
+        if (record.lastDreamAttempt > record.lastDreamSuccess &&
+            this.now() < dreamDueAt(record.lastDreamAttempt, this.config.dream.hour)) continue;
         try {
           const session = await this.session(key);
           if (!session.isIdle || this.closing) continue;
@@ -370,20 +395,23 @@ export class PiAgent implements Agent {
           if (this.closing) continue;
           const { claims } = parseSavedClaims(reply);
           const missing = this.unverifiedClaims(key, claims, before);
+          this.reportIndexCap(key); // Surface cap on every executed dream, not only verified ones.
           if (missing.length) {
             this.log(`Dream memory write unverified; category=memory-write-unverified count=${missing.length}; pending activity retained for a later retry.`);
-            continue; // Do not claim success; the activity stays due and is retried.
+            continue; // Do not claim success; the attempt marker gates the next retry to the next daily boundary.
           }
           record.started = true;
           record.reflectedActivity = record.activity;
           record.pendingSince = 0;
           record.lastDreamSuccess = this.now();
           this.save();
-          const lines = indexLineCount(readMemoryStore(this.workspace(key)).index);
-          if (lines > MEMORY_INDEX_MAX_LINES) {
-            this.log(`Memory index over cap; category=memory-index-over-cap lines=${lines} cap=${MEMORY_INDEX_MAX_LINES}.`);
-          }
-        } catch (error) { this.log(`Dream failed; ${safeDiagnostic(error)}; pending activity retained for a later retry.`); }
+        } catch (error) {
+          this.log(`Dream failed; ${safeDiagnostic(error)}; pending activity retained for a later retry.`);
+          // Transient failure: drop the unresolved-attempt marker so the next tick retries
+          // per-minute (only unverified attempts/crashes gate to the next daily boundary).
+          record.lastDreamAttempt = record.lastDreamSuccess;
+          try { this.save(); } catch { /* save() already disabled the bridge */ }
+        }
       }
     });
   }

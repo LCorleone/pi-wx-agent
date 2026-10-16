@@ -39,6 +39,15 @@ export function factInStore(store: MemoryStore, fact: string): boolean {
   return haystacks.some(text => text.includes(needle));
 }
 
+/** True when two stores have identical index text and identical topic files (content-wise). */
+export function sameMemoryStore(a: MemoryStore, b: MemoryStore): boolean {
+  if (a.index !== b.index) return false;
+  const names = Object.keys(a.topics).sort();
+  const other = Object.keys(b.topics).sort();
+  if (names.length !== other.length) return false;
+  return names.every((name, i) => name === other[i] && a.topics[name] === b.topics[name]);
+}
+
 /** Non-empty line count of the index; used to surface an over-cap index. */
 export function indexLineCount(index: string | null): number {
   if (index === null) return 0;

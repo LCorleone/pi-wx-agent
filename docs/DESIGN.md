@@ -50,8 +50,8 @@ clear 同步鉴权并递增代际编号，使尚未返回的旧 chat 回复/旧�
 
 Pi 原生加载 cwd/父目录/agentDir 的 AGENTS 类 context 文件。项目的通用模板要求：
 
-- **两层记忆**：`MEMORY.md` 是索引（每条一行，软上限约 150 行），详情放 `memory/<topic>.md` 按需读取；索引超限时把细节移入 topic 文件。`src/memory.ts` 的 `readMemoryStore`/`indexLineCount` 供桥接读取索引与 topic 文件、统计行数。**超限不自动裁剪、也不阻止丢失**，只在 `/status` 展示并在 dream 成功后记录 `memory-index-over-cap` 诊断；维持索引大小靠提示词约束模型。`readMemoryStore` 对不可读/非目录的 `memory` 路径按「无 topic」处理，永不抛出。
-- **写后校验（不假装成功）**：模型保存事实时须输出 `MEMORY_SAVED: <原文>` 标记行。`parseSavedClaims` 只剥离**末尾连续、行首锚定**的标记行（`/^\s*[-*]?\s*MEMORY_SAVED:\s*(\S.*)$/`）得到用户可见文本并收集声明；正文中提到标记、或标记不在行首的行一律原样保留。桥接在运行**前**对工作区取快照（`readMemoryStore`），运行后用 `factInStore` 在 `MEMORY.md` 与 `memory/*.md` 中核对：仅当原文在运行后存在**且运行前不存在**时判为已写入，因此重复要求记住已有事实不算本轮写入。核对失败记录 `memory-write-unverified` 并在回复后追加提示；dream 核对失败则不标记成功、保留待处理活动重试。用户以命令式明确「记住」但无任何标记也按未确认处理（`REMEMBER_INTENT` 要求命令式+宾语，如「记住这件事」）。
+- **两层记忆**：`MEMORY.md` 是索引（每条一行，软上限约 150 行），详情放 `memory/<topic>.md` 按需读取；索引超限时把细节移入 topic 文件。`src/memory.ts` 的 `readMemoryStore`/`indexLineCount` 供桥接读取索引与 topic 文件、统计行数。**超限不自动裁剪、也不阻止丢失**，只在 `/status` 展示并在每次实际执行的 dream 后记录 `memory-index-over-cap` 诊断；维持索引大小靠提示词约束模型。`readMemoryStore` 对不可读/非目录的 `memory` 路径按「无 topic」处理，永不抛出。
+- **写后校验（不假装成功）**：模型保存事实时须输出 `MEMORY_SAVED: <原文>` 标记行。`parseSavedClaims` 只剥离**末尾连续、行首锚定**的标记行（`/^\s*[-*]?\s*MEMORY_SAVED:\s*(\S.*)$/`）得到用户可见文本并收集声明；正文中提到标记、或标记不在行首的行一律原样保留（中间出现的标记行会原样发给用户）。桥接在运行**前**对工作区取快照（`readMemoryStore`），运行后用 `sameMemoryStore` 比较前后存储：存储**未变**（模型什么都没写）时全部声明判为未确认；存储**已变**时，只要原文在运行后存在即判为已写入（`factInStore`）。因此改写/合并/迁移已有事实（存储已变）会通过，重复要求记住已有事实而模型不写任何东西则未确认。核对失败记录 `memory-write-unverified` 并在回复后追加提示；dream 核对失败则不标记成功、保留待处理活动重试（避免每分钟重跑模型）。用户以命令式明确「记住」但无任何标记也按未确认处理（`REMEMBER_INTENT` 要求行首命令式，如「记住这件事」「帮我记住明天开会」）。dream 每次实际执行后都检查索引是否超限并记录 `memory-index-over-cap`（不只成功路径）。
 - 不记录秘密；实际检查写入，不凭空承诺保存。
 
 MEMORY 是磁盘文件，不是额外 LLM 提取流程；模型是否正确读写不保证。校验是提示词驱动、尽力而为：标记可能被遗漏或与实际写入不符。压缩/clear 不删文件；原始 JSONL/备份可能仍含已要求忘记的内容。分发模板不包含任何部署者私人指令。既有工作区不会被自动改写，需手动迁移才能采用新约定。
@@ -70,7 +70,7 @@ MEMORY 是磁盘文件，不是额外 LLM 提取流程；模型是否正确读�
 
 若 FIFO 忙，暂不加入 dream，下分钟重试；idle 会话在 FIFO 内真正 `await prompt(DREAM_PROMPT)`。反思读 MEMORY 并只整理当前可见上下文，不能恢复已压缩原文。
 
-**运行标记使漏跑可检测、重复跑幂等**：尝试开始前先写 `lastDreamAttempt` 落盘；`lastDreamAttempt > lastDreamSuccess` 即表示上次尝试未成功，`/status` 会提示。成功后写 `reflectedActivity = activity`、清 `pendingSince`、写 `lastDreamSuccess`，因此无新活动不重复、已覆盖 activity 不重复处理。核对 `MEMORY_SAVED` 失败时**不**推进成功标记，活动保留到期重试。文本永不发微信。失败不更新成功标记，后续重试；run 成功且标记可核对才视为成功。模型完成到状态落盘间崩溃可能重复，非 exactly-once。清理与反思完全串行，dream 不污染回复选择。
+**运行标记使漏跑可检测、重复跑幂等**：尝试开始前先写 `lastDreamAttempt` 落盘。成功后写 `reflectedActivity = activity`、清 `pendingSince`、写 `lastDreamSuccess`，因此无新活动不重复、已覆盖 activity 不重复处理。核对 `MEMORY_SAVED` 失败时**不**推进成功标记；为避免每 60s 重跑模型（账单风险），未验证失败（`lastDreamAttempt > lastDreamSuccess`）会将该会话的到期时间推后到该次尝试后的下一个每日边界（`now >= dreamDueAt(lastDreamAttempt, hour)`）才重跑，`/status` 会提示「上次 dream 验证未通过」。而抛出/提供商错误会重置 attempt 标记（`lastDreamAttempt = lastDreamSuccess`），保留每分钟重试（可能瞬时故障）；这类错误**不**触发 `/status` 的验证未通过提示，而是通过日志与「有待处理活动」行（`pendingSince` 保留）可见。不新增状态字段。文本永不发微信。run 成功且标记可核对才视为成功。模型完成到状态落盘间崩溃可能重复，非 exactly-once。清理与反思完全串行，dream 不污染回复选择。
 
 不新增调度器：复用 `main.ts` 已有的每分钟 `setInterval` 与启动时一次调用。
 
