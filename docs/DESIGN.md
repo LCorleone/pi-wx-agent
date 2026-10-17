@@ -11,7 +11,7 @@
                       ↓ Pi 自管 JSONL
 ```
 
-微信 SDK 原生全局串行，但定时 dream 与同步 clear 回调不在同一异步生命周期，桥接必须共享一个 FIFO。只支持一个 owner 与受限媒体通道（见「媒体收发」），不引 cron 库/数据库/外部模型提取管道。
+微信 SDK 原生全局串行，但定时 dream 与同步 clear 回调不在同一异步生命周期，桥接必须共享一个 FIFO。支持一个 owner 与受邀成员（见「多用户家庭版」）与受限媒体通道（见「媒体收发」），不引 cron 库/数据库/外部模型提取管道。
 
 模块：`main.ts` 管配置/微信登录/停止/定时器，并安装 fetch 兼容垫片（见下）；`config.ts` 校验配置；`state.ts` 管可验证的原子持久状态；`memory.ts` 读写两层记忆（索引/topic、行数、原文核对）；`pi-agent.ts` 管认领/串行生命周期/命令/记忆规则/dream；`pi-session.ts` 适配并验证真实 Pi API。没有全局安装依赖。
 
@@ -30,7 +30,7 @@
 
 授权后 chat 入 FIFO，读取/新建 `dataDir/conversations/<sha256(conversationId)>`，不以原始 ID 拼路径。首次写项目自有 `AGENTS.md`（已有文件不覆盖；若已有文件内容与当前模板不同，仅记录一条迁移提示，绝不改写）。FIFO 内、会话建立后先做入站媒体准备（见下节），再快照记忆、`run(prompt)`；回复先剥 ATTACH 末尾块再解析 MEMORY_SAVED（见下节）。
 
-**会话自省命令**在桥接层（`chat()` 鉴权之后、入 FIFO 之前）拦截，与 chat/clear 同等鉴权：未授权直接返回「未授权」且不创建/恢复/运行任何 Pi。支持 `/status`、`/cost`、`/context`、`/compact [说明]`、`/stop`。SDK 自带 `/echo`、`/toggle-debug`、`/clear` 仍在桥接之前处理（`/clear` 的鉴权由本桥接执行）。
+**会话自省命令**在桥接层（`chat()` 鉴权之后、入 FIFO 之前）拦截，与 chat/clear 同等鉴权：未授权直接返回「未授权」且不创建/恢复/运行任何 Pi。owner 与成员均可用 `/status`、`/cost`、`/context`、`/compact [说明]`、`/stop`（均只作用于自己的会话）；`/invite`、`/members`、`/kick` 仅 owner（见「多用户家庭版」）。SDK 自带 `/echo`、`/toggle-debug`、`/clear` 仍在桥接之前处理（`/clear` 的鉴权由本桥接执行）。
 
 - `/status`、`/cost`、`/context` 是只读：读 `getSessionStats()`、`getContextUsage()`、`session.model`/`thinkingLevel`，不触发模型调用；无活跃会话时返回明确提示。`/status` 还展示 dream 覆盖计数、上次成功/尝试时间与记忆索引行数。
 - `/compact` 入 FIFO 并调用 Pi 原生 `session.compact(customInstructions?)`（其内部先 `abort()`），返回 `tokensBefore`/`estimatedTokensAfter`；上下文太小或已压缩会失败并给出通用提示，不向微信转发原始异常。
@@ -70,6 +70,18 @@ MEMORY 是磁盘文件，不是额外 LLM 提取流程；模型是否正确读�
 
 **入站去重（决策：不做）**：SDK 在派发消息前就持久化 get_updates 游标（`monitor.ts:113-117` 先 `saveGetUpdatesBuf` 落盘、`monitor.ts:120-131` 才进入消息循环调 `agent.chat()`），因此是 at-most-once：崩溃丢消息、不重放。无重放窗口 → 无需去重环，也未新增任何状态。边缘：若游标落盘本身失败（磁盘错误），同一批消息可能被重新拉取并再次派发——罕见重复窗口，桥接不做去重。
 
+## 多用户家庭版（成员邀请制，v3 增量）
+
+**角色**：owner（部署者，一次性认领）+ members（受邀家人）。`authorized(id) = isOwner(id) || members[hash(id)] 存在`；鉴权仍在一切 Pi 调用之前，未授权消息照旧拒绝且不触 Pi。家人可信、无沙箱（部署决策）；硬约束是隔离：会话/工作区/MEMORY 本就按 `workspace(hash(conversationId))` 分目录，本设计未引入任何跨会话记忆读取，也不做按用户计费（/cost 本就按会话）。
+
+**状态（全部增量，旧 state.json 缺省为空，不放松任何既有字段校验）**：`members: { <hash>: { joinedAt } }`（缺省 `{}`）、`invite: { hash, expiresAt } | null`（缺省 `null` = 无活跃邀请）。沿用同一原子写与严格校验风格：成员键必须是 64 位十六进制且不得等于 owner（owner 永远不在名册里，故不可被 /kick），`joinedAt`/`expiresAt` 必须是非负安全整数，`invite.hash` 必须是哈希；**owner 为 null 时名册必须为空**（加入只可能发生在认领之后）；非法即拒绝启动，绝不自动重置。唯一调整的既有关系约束：v1 要求 conversations 键必须等于 owner 哈希（单 owner 不变量），多用户下改为只验哈希格式——成员资格是动态的（被踢者的会话记录为重邀请保留），会话归属改在访问时校验（`authorized()`/`keyAuthorized()`）。
+
+**加入**：未授权消息在认领分支之后尝试 `tryJoin`：要求 owner 已认领（未认领部署不认任何邀请码）、邀请未过期、文本 trim 后与邀请码**哈希 timingSafe 比较**精确相等。命中即写入名册并**先落盘再回欢迎语**（说明这是部署者的助理、用量由部署者承担、命令清单）；落盘失败禁用桥接（与认领同风格）。不设尝试预算（认领才有 5 次全局预算）；邀请码不消耗，24h 窗口内多人可用同一码。过期/无码/不匹配照旧「未授权」。
+
+**管理命令（仅 owner；成员使用直接拒绝、不触 Pi）**：`/invite` 生成 128-bit 码、只存哈希、TTL 24h、再次生成即作废旧码；`/members` 按 joinedAt（哈希做稳定 tie-break）列出序号+加入时间，不显示哈希；`/kick <序号>` 按同一序号删除名册项（回复含该成员加入时间，便于核对序号错位），无效序号只提示不变更。被踢者下一条消息回到未授权；**已在 FIFO 排队的消息也不会执行**（入队闭包会重跑 authorized），其待 dream 活动也不再被调度（dream 循环按 `keyAuthorized` 过滤，避免 owner 为已移除者付模型费）；**踢人同时把 `invite` 置空作废当前码**——被踢者聊天记录里的旧码最多还有 24h 有效，不轮换即可原码静默重新加入；未完成加入的家人需重新 `/invite`。其工作区/会话映射保留，重新邀请后原会话精确恢复（踢人不是擦除）。
+
+**/stop 归属（多用户必须）**：会话表按 `hash(conversationId)` 键控，`/stop` 的中止目标永远是**发送者自己的会话**——结构上不可能中止别人的 chat 或 dream；发送者自己没有会话时回复说明而非动作。SDK 串行派发不变，故 /stop 只能中止自己会话的后台 dream（或将来并发派发时自己正在跑的 turn）。已有 `/stop` 对 dream 的中止语义保留，仅限自己的会话。
+
 ## Dream 调度
 
 配置 `{enabled,hour}`；本地时区每日 hour，启动及每分钟检查。每会话持久记录：
@@ -97,7 +109,7 @@ Pi 在部分安装形态下会把自己携带的新版 undici 装成全局 fetch
 ```text
 <resolved dataDir>/
   openclaw-weixin/             # 微信 SDK 的真实子树，不是 openclaw/
-  state.json                  # owner、认领、UUID 映射、活动/反思/attempt 标记
+  state.json                  # owner、认领、成员名册/邀请、UUID 映射、活动/反思/attempt 标记
   conversations/<hash>/       # cwd / AGENTS.md / MEMORY.md / memory/<topic>.md / media/
 <service HOME>/.pi/agent/
   sessions/<encoded-cwd>/...jsonl   # 默认外部 Pi 会话位置
@@ -110,6 +122,6 @@ systemd 仅提供可编辑非 root 示例，不自动安装；先手动认证/�
 
 ## 验证边界
 
-离线测试覆盖 fake session/clock/temp dir 下的授权、一次性码预算、故障拒绝、路径、精确恢复/clear、并发、午夜/离线/忙/失败 dream、关闭和新鲜回复识别；写后校验（成功/失败/仅提及标记/带尾注/列表项/topic 命中/重复要求已有事实/无标记）、命令式记住匹配、dream 幂等与漏跑检测、自省命令鉴权与行为（含 /stop 确实调用 abort）、记忆索引超限、非目录 memory 路径；入站图片与文件/视频统一复制到 media/ 并以路径注记（媒体字节不进提示词；图片扩展名由魔数嗅探补充、未知保持 .bin）、复制失败降级（chat 不中断、无路径泄漏）、文件/视频复制与路径注记（含重名后缀、恶意文件名、源缺失降级）、语音透传（有字/无字）、ATTACH 解析单测与集成（有效 image/video/file、越界/绝对路径/目录/缺失/符号链接逃逸拒绝、多条取舍、与 MEMORY_SAVED 组合及顺序颠倒取舍）；额外实际安装 SDK 测试只在隔离临时 HOME/agentDir 构建会话/JSONL、不 prompt，验证 AGENTS 注入、UUID 恢复和压缩开关。
+离线测试覆盖 fake session/clock/temp dir 下的授权、一次性码预算、故障拒绝、路径、精确恢复/clear、并发、午夜/离线/忙/失败 dream、关闭和新鲜回复识别；写后校验（成功/失败/仅提及标记/带尾注/列表项/topic 命中/重复要求已有事实/无标记）、命令式记住匹配、dream 幂等与漏跑检测、自省命令鉴权与行为（含 /stop 确实调用 abort）、记忆索引超限、非目录 memory 路径；入站图片与文件/视频统一复制到 media/ 并以路径注记（媒体字节不进提示词；图片扩展名由魔数嗅探补充、未知保持 .bin）、复制失败降级（chat 不中断、无路径泄漏）、文件/视频复制与路径注记（含重名后缀、恶意文件名、源缺失降级）、语音透传（有字/无字）、ATTACH 解析单测与集成（有效 image/video/file、越界/绝对路径/目录/缺失/符号链接逃逸拒绝、多条取舍、与 MEMORY_SAVED 组合及顺序颠倒取舍）；多用户家庭版（邀请加入/过期/轮换/未认领不收人、管理命令仅 owner、/members //kick 序号与重编号、被踢者排队消息不执行且不再 dream、成员工作区/媒体/MEMORY 隔离、/stop 只中止自己的会话含 dream、旧 state.json 无感升级、新字段严格校验）；额外实际安装 SDK 测试只在隔离临时 HOME/agentDir 构建会话/JSONL、不 prompt，验证 AGENTS 注入、UUID 恢复和压缩开关。
 
 人工验收仍必需：微信 QR/真实文字往返、真实图片往返（发送→模型描述）、真实 ATTACH 文件往返、真实长上下文自动压缩、MEMORY 写入/读取质量、`MEMORY_SAVED` 标记在真实模型下的可靠性、真实 dream 后文件变化及无微信反思回复、真实 `/status` `/cost` `/context` `/compact` `/stop` 往返。详见 README。

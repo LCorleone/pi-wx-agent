@@ -6,7 +6,7 @@ import type { CompactionResult, ContextUsage, SessionStats } from "@earendil-wor
 import type { Config } from "./config.js";
 import { safeDiagnostic } from "./diagnostics.js";
 import { factInStore, indexLineCount, MEMORY_INDEX_MAX_LINES, readMemoryStore, sameMemoryStore, type MemoryStore } from "./memory.js";
-import { hash, readState, writeState, type Conversation, type State } from "./state.js";
+import { hash, readState, writeState, type Conversation, type Member, type State } from "./state.js";
 
 // Public, project-owned instructions; never copied from the operator's Pi configuration.
 export const MEMORY_INSTRUCTIONS = `# Personal assistant memory
@@ -172,8 +172,18 @@ function sanitizeFileName(name: string | undefined): string {
   return base === "." || base === ".." ? "" : base;
 }
 
-export type SessionCommand = "status" | "cost" | "context" | "compact" | "stop";
-const SESSION_COMMANDS = new Set<string>(["status", "cost", "context", "compact", "stop"]);
+export type SessionCommand = "status" | "cost" | "context" | "compact" | "stop" | "invite" | "members" | "kick";
+const SESSION_COMMANDS = new Set<string>(["status", "cost", "context", "compact", "stop", "invite", "members", "kick"]);
+/** Commands only the owner (deployer) may use; members get a refusal, never a Pi call. */
+const OWNER_COMMANDS = new Set<string>(["invite", "members", "kick"]);
+/** A 24-hour multi-use invite window. */
+const INVITE_TTL_MS = 24 * 3600_000;
+/** Sent once when an unauthorized sender joins via the active invite code. */
+const MEMBER_WELCOME = [
+  "欢迎加入！这是部署者的个人助理：模型用量由部署者承担，请勿发送密码、密钥等敏感信息。",
+  "你的会话、工作区与记忆和其他成员完全隔离。可直接发送文字、图片、文件或语音；",
+  "可用命令：/status /cost /context /compact /stop /clear（均只作用于你自己的会话）。",
+].join("\n");
 
 /** Recognize a bridge-handled command. The SDK intercepts /echo, /toggle-debug and /clear first. */
 export function parseCommand(text: string): { command: SessionCommand; args: string } | null {
@@ -249,7 +259,33 @@ export class PiAgent implements Agent {
   }
 
   private authorized(id: string): boolean {
-    return !!id && this.state.owner === hash(id) && !this.unhealthy && !this.closing;
+    if (!id || this.unhealthy || this.closing) return false;
+    const key = hash(id);
+    return this.state.owner === key || this.state.members[key] !== undefined;
+  }
+
+  /** Authorization check by workspace key (owner hash or member hash), e.g. for dream. */
+  private keyAuthorized(key: string): boolean {
+    return key === this.state.owner || this.state.members[key] !== undefined;
+  }
+
+  /**
+   * An unauthorized sender may join by sending exactly the active invite code.
+   * Requires a claimed owner (an unclaimed deployment admits nobody via invite),
+   * an unexpired invite, and a timing-safe hash match. Joining persists the roster
+   * before replying; a persistence failure disables the bridge, same as the claim
+   * flow. Never calls Pi. Returns the welcome reply, or null when not a join.
+   */
+  private tryJoin(request: ChatRequest): ChatResponse | null {
+    if (!request.conversationId || this.needsClaim) return null;
+    const invite = this.state.invite;
+    if (!invite || invite.expiresAt <= this.now()) return null;
+    const matches = timingSafeEqual(Buffer.from(hash(request.text.trim()), "hex"), Buffer.from(invite.hash, "hex"));
+    if (!matches) return null;
+    this.state.members[hash(request.conversationId)] = { joinedAt: this.now() };
+    try { this.save(); }
+    catch { this.log("Membership persistence failed; bridge disabled."); return { text: "加入失败，请联系部署者。" }; }
+    return { text: MEMBER_WELCOME };
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -437,12 +473,18 @@ export class PiAgent implements Agent {
         catch { this.log("Authorization persistence failed; bridge disabled."); return { text: "认领失败，请联系部署者。" }; }
         if (matches) return { text: "认领成功。现在可以开始对话。" };
       }
+      const joined = this.tryJoin(request);
+      if (joined) return joined;
       this.log("Denied unauthorized chat.");
       return { text: "未授权" };
     }
     const key = hash(request.conversationId);
     const command = parseCommand(request.text);
     // Authorization already passed above; no Pi call happens for unauthorized callers.
+    // Owner-only management commands refuse members before any handler runs.
+    if (command && OWNER_COMMANDS.has(command.command) && this.state.owner !== key) {
+      return { text: "该命令仅部署者可用。" };
+    }
     if (command) return this.handleCommand(command.command, command.args, key, request.conversationId);
     const generation = this.generation;
     return this.enqueue(async () => {
@@ -488,13 +530,48 @@ export class PiAgent implements Agent {
     try {
       switch (command) {
         case "stop": {
+          // Ownership: sessions are keyed by hash(conversationId), so this can only
+          // ever abort the SENDER's own session — never another member's chat or
+          // dream. The no-session case explains that scope instead of acting.
           const session = this.sessions.get(key);
-          if (!session) return { text: "没有正在运行的会话。" };
+          if (!session) return { text: "没有正在运行的会话（/stop 只作用于你自己的会话）。" };
           // Aborts whatever the session is doing (a background dream, or a chat turn if
           // the SDK ever dispatches concurrently). The SDK's serial dispatch means a
           // /stop sent during a chat is processed only after that chat returns.
           await session.abort();
           return { text: "已请求中止当前任务（若正在运行）。" };
+        }
+        case "invite": {
+          const code = randomBytes(16).toString("hex");
+          this.state.invite = { hash: hash(code), expiresAt: this.now() + INVITE_TTL_MS };
+          this.save(); // Issuing a new code invalidates any previous one.
+          return { text: `邀请码已生成（24 小时内有效，窗口内多人可用同一码，再次 /invite 将作废旧码）：\n${code}` };
+        }
+        case "members": {
+          const list = this.sortedMembers();
+          if (!list.length) return { text: "还没有成员。用 /invite 生成邀请码。" };
+          return {
+            text: [
+              `成员（共 ${list.length} 位，序号供 /kick 使用）：`,
+              ...list.map(([key, member], i) => `${i + 1}. ${new Date(member.joinedAt).toISOString()} 加入`),
+            ].join("\n"),
+          };
+        }
+        case "kick": {
+          const list = this.sortedMembers();
+          const index = Number(args);
+          if (!Number.isInteger(index) || index < 1 || index > list.length) {
+            return { text: `无效的序号，未做任何变更。先用 /members 查看（当前 1–${list.length}）。` };
+          }
+          const [kicked, member] = list[index - 1]!;
+          delete this.state.members[kicked]; // The owner is never in the roster, so never kickable.
+          // Rotate the invite on kick: the kicked member still holds the active code in
+          // their WeChat history (valid up to 24h) and would silently re-join otherwise.
+          this.state.invite = null;
+          this.save();
+          return {
+            text: `已移除成员 ${index}（${new Date(member.joinedAt).toISOString()} 加入）。该成员的下一条消息将回到未授权状态（已排队的消息也不会执行）；当前邀请码已同时作废，未加入的家人需要新码（再次 /invite 生成）。`,
+          };
         }
         case "compact": {
           if (!this.sessions.get(key)) return { text: "尚无会话，无需压缩。" };
@@ -564,6 +641,12 @@ export class PiAgent implements Agent {
     return `上下文占用: ${fmt(usage.tokens)} / ${fmt(usage.contextWindow)} tokens（${usage.percent?.toFixed(1)}%）。`;
   }
 
+  /** Members in stable /members order: join time first, hash as the tie-breaker. */
+  private sortedMembers(): Array<[string, Member]> {
+    return Object.entries(this.state.members)
+      .sort((a, b) => a[1].joinedAt - b[1].joinedAt || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  }
+
   clearSession(conversationId: string): void {
     if (!this.authorized(conversationId)) {
       this.log("Denied unauthorized clear.");
@@ -584,7 +667,8 @@ export class PiAgent implements Agent {
     if (!this.config.dream.enabled || this.pending || this.closing || this.unhealthy) return;
     await this.enqueue(async () => {
       for (const [key, record] of Object.entries(this.state.conversations)) {
-        if (this.closing || this.unhealthy || record.activity === record.reflectedActivity ||
+        if (this.closing || this.unhealthy || !this.keyAuthorized(key) ||
+            record.activity === record.reflectedActivity ||
             this.now() < dreamDueAt(record.pendingSince, this.config.dream.hour)) continue;
         // Backoff after an UNVERIFIED attempt (lastDreamAttempt > lastDreamSuccess): wait
         // until the next daily boundary after that attempt instead of retrying every tick.

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -932,7 +932,7 @@ test("A1 existing AGENTS.md is never overwritten and logs a migration note", asy
 test("A4 session commands require authorization and never reach Pi when unauthorized", async t => {
   const f = fixture(t);
   const agent = f.make();
-  for (const command of ["/status", "/cost", "/context", "/compact", "/stop"]) {
+  for (const command of ["/status", "/cost", "/context", "/compact", "/stop", "/invite", "/members", "/kick 1"]) {
     const response = await agent.chat(message(command, "stranger"));
     assert.equal(response.text, "未授权", `${command} must be rejected`);
   }
@@ -1060,4 +1060,403 @@ test("A1 memory index cap surfaces over-cap state via /status", async t => {
   const response = await agent.chat(message("/status"));
   assert.match(response.text, /已超限/);
   await agent.close();
+});
+
+// ---------------------------------------------------------------------------
+// #003 多用户家庭版：成员邀请制（owner + invited members）
+// ---------------------------------------------------------------------------
+
+/** Claim the owner and return one active invite code issued via /invite. */
+async function inviteCode(agent) {
+  const response = await agent.chat(message("/invite"));
+  assert.match(response.text, /24 小时内有效/);
+  return response.text.match(/\b([a-f0-9]{32})\b/)[1];
+}
+
+test("invite: owner issues a 24h multi-use code; exact match joins with a welcome and no Pi call", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  // Without an invite even code-shaped text is rejected.
+  assert.equal((await agent.chat(message("a".repeat(32), "sister"))).text, "未授权");
+  const code = await inviteCode(agent);
+  assert.equal(f.state().invite.hash, hash(code));
+  assert.equal(f.state().invite.expiresAt, f.now + 24 * 3600_000);
+  // Strangers and wrong codes stay rejected; the invite is not consumed.
+  assert.equal((await agent.chat(message("hello", "sister"))).text, "未授权");
+  const wrong = `${code.slice(0, 31)}${code[31] === "0" ? "1" : "0"}`;
+  assert.equal((await agent.chat(message(wrong, "sister"))).text, "未授权");
+  // Exact code joins: welcome text, durable roster, still no Pi session.
+  const joined = await agent.chat(message(code, "sister"));
+  assert.match(joined.text, /欢迎加入/);
+  assert.match(joined.text, /部署者/);
+  assert.match(joined.text, /用量由部署者承担/);
+  assert.match(joined.text, /\/status \/cost \/context \/compact/);
+  assert.equal(f.sessions.length, 0, "joining must not create a Pi session");
+  assert.deepEqual(f.state().members, { [hash("sister")]: { joinedAt: f.now } });
+  // The same code admits several members inside the window.
+  f.setNow(f.now + 60_000);
+  assert.match((await agent.chat(message(code, "brother"))).text, /欢迎加入/);
+  assert.equal(Object.keys(f.state().members).length, 2);
+  // A joined member chats normally in their own workspace.
+  assert.equal((await agent.chat(message("hi", "sister"))).text, "reply:hi");
+  assert.equal(f.sessions[0].cwd, join(f.dataDir, "conversations", hash("sister")));
+  await agent.close();
+});
+
+test("invite expiry and rotation: expired or superseded codes never admit anyone", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  const first = await inviteCode(agent);
+  f.setNow(f.now + 24 * 3600_000 + 1);
+  assert.equal((await agent.chat(message(first, "late"))).text, "未授权", "expired code");
+  const second = await inviteCode(agent);
+  assert.notEqual(second, first);
+  assert.equal((await agent.chat(message(first, "late"))).text, "未授权", "rotated old code");
+  assert.match((await agent.chat(message(second, "late"))).text, /欢迎加入/);
+  // The active invite survives a restart: hash and expiry are durable state.
+  await agent.close();
+  const reborn = f.make();
+  assert.match((await reborn.chat(message(second, "grandma"))).text, /欢迎加入/, "same code still admits after restart");
+  await reborn.close();
+});
+
+test("an unclaimed deployment admits nobody via invite codes", async t => {
+  const f = fixture(t);
+  // Hand-written state that no API path can produce: no owner yet, active invite.
+  writeFileSync(join(f.dataDir, "state.json"), JSON.stringify({
+    version: 1, owner: null, claim: null, members: {},
+    invite: { hash: hash("deadbeef"), expiresAt: f.now + 3600_000 }, conversations: {},
+  }));
+  const agent = f.make();
+  assert.equal((await agent.chat(message("deadbeef", "cousin"))).text, "未授权");
+  assert.deepEqual(f.state().members, {});
+  assert.equal(f.sessions.length, 0);
+  await agent.close();
+});
+
+test("management commands are owner-only; members keep session commands on their own session", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  const code = await inviteCode(agent);
+  assert.match((await agent.chat(message(code, "sister"))).text, /欢迎加入/);
+  for (const command of ["/invite", "/members", "/kick 1"]) {
+    assert.equal((await agent.chat(message(command, "sister"))).text, "该命令仅部署者可用。", `${command} is owner-only`);
+  }
+  assert.equal(f.sessions.length, 0, "refused management commands never create Pi sessions");
+  // Session commands work for a member, scoped to their OWN session and workspace.
+  await agent.chat(message("warmup", "sister"));
+  const sister = f.sessions.at(-1);
+  assert.match((await agent.chat(message("/status", "sister"))).text, /会话状态/);
+  assert.match((await agent.chat(message("/cost", "sister"))).text, /合计: 15/);
+  assert.match((await agent.chat(message("/context", "sister"))).text, /100 \/ 1,000 tokens/);
+  assert.match((await agent.chat(message("/compact", "sister"))).text, /已压缩/);
+  assert.equal(sister.compactCalls, 1);
+  const status = (await agent.chat(message("/status", "sister"))).text;
+  assert.ok(status.includes(hash("sister").slice(0, 8)), "member status names the member workspace");
+  assert.ok(!status.includes(hash("owner").slice(0, 8)), "member status never leaks the owner workspace");
+  // /clear by a member disposes only their own session; the owner's stays alive.
+  await agent.chat(message("owner warmup"));
+  const owner = f.sessions.at(-1);
+  assert.notEqual(owner, sister);
+  agent.clearSession("sister");
+  await agent.drain();
+  assert.equal(sister.disposed, true);
+  assert.equal(owner.disposed, false);
+  await agent.close();
+});
+
+test("/members lists join dates without hashes; /kick removes by ordinal, renumbers and guards input", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  const code = await inviteCode(agent);
+  assert.match((await agent.chat(message("/members"))).text, /还没有成员/, "empty roster is a non-error");
+  assert.match((await agent.chat(message(code, "sister"))).text, /欢迎加入/);
+  const sisterJoined = f.now;
+  f.setNow(f.now + 60_000);
+  assert.match((await agent.chat(message(code, "brother"))).text, /欢迎加入/);
+  const brotherJoined = f.now;
+  const list = (await agent.chat(message("/members"))).text;
+  assert.match(list, /共 2 位/);
+  assert.ok(list.includes(`1. ${new Date(sisterJoined).toISOString()} 加入`));
+  assert.ok(list.includes(`2. ${new Date(brotherJoined).toISOString()} 加入`));
+  assert.ok(!list.includes(hash("sister")), "member hashes are never displayed");
+  // Kick the first member: she is unauthorized from her next message; brother remains.
+  // The reply names the join date so an ordinal mismatch (someone joining between
+  // /members and /kick) is visible to the owner.
+  const kick = (await agent.chat(message("/kick 1"))).text;
+  assert.match(kick, new RegExp(`已移除成员 1（${new Date(sisterJoined).toISOString()} 加入）`));
+  assert.match(kick, /邀请码已同时作废/);
+  assert.equal((await agent.chat(message("hello", "sister"))).text, "未授权");
+  assert.match((await agent.chat(message("hello", "brother"))).text, /reply:hello/);
+  const after = (await agent.chat(message("/members"))).text;
+  assert.match(after, /共 1 位/);
+  assert.ok(after.includes(`1. ${new Date(brotherJoined).toISOString()} 加入`), "roster renumbers after a kick");
+  // Invalid ordinals and non-numbers change nothing.
+  for (const bad of ["/kick 0", "/kick 2", "/kick -1", "/kick x", "/kick"]) {
+    assert.match((await agent.chat(message(bad))).text, /无效的序号/, `${bad} is rejected`);
+  }
+  assert.deepEqual(Object.keys(f.state().members), [hash("brother")]);
+  // Kicking also invalidated the invite: the code still sitting in the kicked member's
+  // WeChat history must not silently re-admit her — nor anyone else.
+  assert.equal((await agent.chat(message(code, "sister"))).text, "未授权", "kicked member cannot re-join with the old code");
+  assert.equal((await agent.chat(message(code, "outsider"))).text, "未授权", "the invalidated code is dead for everyone");
+  // A fresh code admits new members again.
+  const fresh = await inviteCode(agent);
+  assert.match((await agent.chat(message(fresh, "cousin"))).text, /欢迎加入/);
+  await agent.close();
+});
+
+test("kick is not erasure: a re-invited member resumes their own workspace and session", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  const first = await inviteCode(agent);
+  assert.match((await agent.chat(message(first, "sister"))).text, /欢迎加入/);
+  await agent.chat(message("remember this", "sister"));
+  const id = f.sessions[0].id;
+  const workspace = f.sessions[0].cwd;
+  writeFileSync(join(workspace, "MEMORY.md"), "- sister 的私事\n");
+  await agent.chat(message("/kick 1"));
+  assert.equal((await agent.chat(message("hello", "sister"))).text, "未授权");
+  // Rejoin with a fresh code: the same conversation mapping and memory come back.
+  const second = await inviteCode(agent);
+  assert.match((await agent.chat(message(second, "sister"))).text, /欢迎加入/);
+  assert.match((await agent.chat(message("back", "sister"))).text, /reply:back/);
+  assert.equal(f.sessions.at(-1).id, id, "exact session identity is restored");
+  assert.equal(readFileSync(join(workspace, "MEMORY.md"), "utf8"), "- sister 的私事\n");
+  await agent.close();
+});
+
+test("a kicked member's queued chat never runs and their dream is not scheduled", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  const code = await inviteCode(agent);
+  await agent.chat(message(code, "sister"));
+  f.setNow(f.now + 60_000); // distinct join times keep /members ordinals deterministic
+  await agent.chat(message(code, "brother"));
+  await agent.chat(message("sister facts", "sister"));
+  await agent.chat(message("brother facts", "brother"));
+  const sister = f.sessions[0];
+  const brother = f.sessions[1];
+  // Hold the FIFO with the owner's gated chat; sister queues behind it, then is kicked.
+  await agent.chat(message("owner warmup"));
+  const owner = f.sessions.at(-1);
+  owner.gate = deferred();
+  owner.started = deferred();
+  const ownerRun = agent.chat(message("slow"));
+  await owner.started.promise;
+  const queued = agent.chat(message("never mind", "sister"));
+  await agent.chat(message("/kick 1")); // sister joined first
+  owner.gate.resolve();
+  await ownerRun;
+  assert.deepEqual(await queued, {}, "queued chat of a kicked member must not run");
+  assert.ok(!sister.calls.some(call => call.includes("never mind")), "no prompt ever reached Pi");
+  // Dreams are owner/member-scoped: only brother's pending activity is reflected.
+  f.setNow(new Date(2026, 9, 16, 4).getTime());
+  await agent.dream();
+  assert.ok(!sister.calls.some(call => call === DREAM_PROMPT), "kicked member gets no dream");
+  assert.deepEqual(brother.calls.filter(call => call === DREAM_PROMPT), [DREAM_PROMPT]);
+  await agent.close();
+});
+
+test("members get fully isolated workspaces, media and MEMORY", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  const code = await inviteCode(agent);
+  await agent.chat(message(code, "sister"));
+  await agent.chat(message(code, "brother"));
+  await agent.chat(message("hi", "sister"));
+  await agent.chat(message("hi", "brother"));
+  const sister = f.sessions[0];
+  const brother = f.sessions[1];
+  assert.notEqual(sister.cwd, brother.cwd);
+  assert.equal(sister.cwd, join(f.dataDir, "conversations", hash("sister")));
+  assert.equal(brother.cwd, join(f.dataDir, "conversations", hash("brother")));
+  // Inbound media lands only in the sender's own workspace.
+  writeFileSync(join(f.dataDir, "shared.pdf"), "PDF");
+  await agent.chat({
+    conversationId: "sister", text: "看文件",
+    media: { type: "file", filePath: join(f.dataDir, "shared.pdf"), mimeType: "application/pdf", fileName: "shared.pdf" },
+  });
+  assert.ok(existsSync(join(sister.cwd, "media", "shared.pdf")));
+  assert.ok(!existsSync(join(brother.cwd, "media", "shared.pdf")));
+  // Memory writes verify and persist per member; each store holds only its own facts.
+  sister.run = async () => {
+    writeFileSync(join(sister.cwd, "MEMORY.md"), "- sister 的私事\n");
+    return "记好了。\nMEMORY_SAVED: sister 的私事";
+  };
+  brother.run = async () => {
+    writeFileSync(join(brother.cwd, "MEMORY.md"), "- brother 的私事\n");
+    return "记好了。\nMEMORY_SAVED: brother 的私事";
+  };
+  assert.match((await agent.chat(message("记住我的私事", "sister"))).text, /记好了。/);
+  assert.match((await agent.chat(message("记住我的私事", "brother"))).text, /记好了。/);
+  assert.equal(readMemoryStore(sister.cwd).index, "- sister 的私事\n");
+  assert.equal(readMemoryStore(brother.cwd).index, "- brother 的私事\n");
+  assert.ok(!readMemoryStore(brother.cwd).index.includes("sister"), "no cross-member memory reads");
+  // The owner's workspace is a third, separate space.
+  await agent.chat(message("owner hi"));
+  const owner = f.sessions.at(-1);
+  assert.ok(![sister.cwd, brother.cwd].includes(owner.cwd));
+  await agent.close();
+});
+
+test("/stop only aborts the sender's own session: another member's running task is untouched", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  const code = await inviteCode(agent);
+  await agent.chat(message(code, "sister"));
+  await agent.chat(message("warmup", "sister"));
+  const sister = f.sessions.at(-1);
+  // Sister's long task is mid-run on the FIFO; the owner (no session of their own) /stops.
+  sister.gate = deferred();
+  sister.started = deferred();
+  const running = agent.chat(message("long task", "sister"));
+  await sister.started.promise;
+  const ownerStop = await agent.chat(message("/stop"));
+  assert.match(ownerStop.text, /没有正在运行的会话/);
+  assert.equal(sister.abortCalls, 0, "owner /stop must not abort a member's session");
+  sister.gate.resolve();
+  assert.equal((await running).text, "reply:long task", "the member's task completed normally");
+  // Reverse direction: a member /stops while the OWNER's task runs; only her own (idle) session is aborted.
+  await agent.chat(message("owner warmup"));
+  const owner = f.sessions.at(-1);
+  owner.gate = deferred();
+  owner.started = deferred();
+  const ownerRun = agent.chat(message("owner long task"));
+  await owner.started.promise;
+  const memberStop = await agent.chat(message("/stop", "sister"));
+  assert.match(memberStop.text, /已请求中止/);
+  assert.equal(owner.abortCalls, 0, "member /stop must not abort the owner's session");
+  assert.equal(sister.abortCalls, 1, "member /stop aborted only her own session");
+  owner.gate.resolve();
+  assert.equal((await ownerRun).text, "reply:owner long task");
+  // Dream-abort semantics are preserved and equally self-scoped: her own dream, not others'.
+  f.setNow(new Date(2026, 9, 16, 4).getTime());
+  sister.gate = deferred();
+  sister.started = deferred();
+  const dream = agent.dream();
+  await sister.started.promise;
+  assert.equal(sister.calls.at(-1), DREAM_PROMPT);
+  const stop = await agent.chat(message("/stop", "sister"));
+  assert.match(stop.text, /已请求中止/);
+  assert.equal(sister.abortCalls, 2, "own dream is still abortable");
+  sister.gate.resolve();
+  await dream;
+  assert.equal(owner.abortCalls, 0);
+  await agent.close();
+});
+
+test("live v2 deployment upgrades in place: pre-v3 state.json loads with an empty roster", async t => {
+  const f = fixture(t);
+  const ownerKey = hash("owner");
+  const v2 = {
+    version: 1, owner: ownerKey, claim: null,
+    conversations: {
+      [ownerKey]: {
+        sessionId: "496130d1-bc15-4ef3-904f-337187e6ba1e", started: true, activity: 17,
+        reflectedActivity: 0, pendingSince: 1792192136031, lastDreamSuccess: 0, lastDreamAttempt: 0,
+      },
+    },
+  };
+  writeFileSync(join(f.dataDir, "state.json"), `${JSON.stringify(v2, null, 2)}\n`);
+  let state = readState(f.dataDir);
+  assert.deepEqual(state.members, {});
+  assert.equal(state.invite, null);
+  assert.equal(state.owner, ownerKey);
+  // Everything keeps working for the owner; the first save writes the additive fields.
+  const agent = f.make();
+  assert.equal((await agent.chat(message("hello"))).text, "reply:hello");
+  state = f.state();
+  assert.deepEqual(state.members, {});
+  assert.equal(state.invite, null);
+  assert.match((await agent.chat(message("/members"))).text, /还没有成员/);
+  const code = await inviteCode(agent);
+  assert.match((await agent.chat(message(code, "sister"))).text, /欢迎加入/);
+  assert.deepEqual(f.state().members, { [hash("sister")]: { joinedAt: f.now } });
+  await agent.close();
+});
+
+test("restart survives member and ex-member conversation records (multi-user state)", async t => {
+  const f = fixture(t);
+  let agent = f.make();
+  await f.claim(agent);
+  const code = await inviteCode(agent);
+  await agent.chat(message(code, "sister"));
+  f.setNow(f.now + 60_000);
+  await agent.chat(message(code, "brother"));
+  await agent.chat(message("sister facts", "sister"));
+  const sisterId = f.sessions[0].id;
+  await agent.chat(message("brother facts", "brother"));
+  const brotherId = f.sessions[1].id;
+  // Kick sister, close, restart: her lingering record must not brick readState.
+  await agent.chat(message("/kick 1")); // sister joined first
+  await agent.close();
+  agent = f.make();
+  // Kicking invalidated the invite before the restart; a restart must not resurrect it.
+  assert.equal((await agent.chat(message(code, "cousin"))).text, "未授权");
+  const fresh = await inviteCode(agent);
+  assert.match((await agent.chat(message(fresh, "cousin"))).text, /欢迎加入/);
+  assert.match((await agent.chat(message("hello", "brother"))).text, /reply:hello/);
+  assert.equal(f.sessions.at(-1).id, brotherId, "member session identity restored across restart");
+  assert.equal((await agent.chat(message("hello", "sister"))).text, "未授权");
+  // Re-invite after restart: sister's exact session comes back from her kept record.
+  const second = await inviteCode(agent);
+  await agent.chat(message(second, "sister"));
+  assert.match((await agent.chat(message("back", "sister"))).text, /reply:back/);
+  assert.equal(f.sessions.at(-1).id, sisterId);
+  await agent.close();
+});
+
+test("v3 state fields are strictly validated; corrupt rosters refuse to start", t => {
+  const f = fixture(t);
+  const ownerKey = hash("owner");
+  const base = {
+    version: 1, owner: ownerKey, claim: null, conversations: {},
+    members: { [hash("sister")]: { joinedAt: 1 } },
+    invite: null,
+  };
+  const bad = [
+    { members: [] },
+    { members: { zz: { joinedAt: 1 } } },
+    { members: { [hash("sister")]: {} } },
+    { members: { [hash("sister")]: { joinedAt: -1 } } },
+    { members: { [hash("sister")]: { joinedAt: "yesterday" } } },
+    { members: { [hash("sister")]: 5 } },
+    { members: { [ownerKey]: { joinedAt: 1 } } },
+    { invite: { hash: "nothex", expiresAt: 1 } },
+    { invite: { hash: hash("x") } },
+    { invite: { hash: hash("x"), expiresAt: -2 } },
+    { invite: "open sesame" },
+    // A roster without an owner is impossible through any API path (joins require a
+    // claimed owner) and must refuse to load; an empty roster on an unclaimed
+    // deployment is normal and stays valid.
+    { owner: null, members: { [hash("sister")]: { joinedAt: 1 } } },
+  ];
+  for (const patch of bad) {
+    writeFileSync(join(f.dataDir, "state.json"), JSON.stringify({ ...base, ...patch }));
+    assert.throws(() => readState(f.dataDir), /Invalid state/, JSON.stringify(patch));
+  }
+  // Absent fields default (additive migration); null invite and empty roster are valid.
+  writeFileSync(join(f.dataDir, "state.json"), JSON.stringify({ version: 1, owner: ownerKey, claim: null, conversations: {} }));
+  const migrated = readState(f.dataDir);
+  assert.deepEqual(migrated.members, {});
+  assert.equal(migrated.invite, null);
+});
+
+test("management command parsing: /invite, /members, /kick", () => {
+  assert.deepEqual(parseCommand("/invite"), { command: "invite", args: "" });
+  assert.deepEqual(parseCommand("  /Members  "), { command: "members", args: "" });
+  assert.deepEqual(parseCommand("/kick 2"), { command: "kick", args: "2" });
+  assert.deepEqual(parseCommand("/KICK  3 "), { command: "kick", args: "3" });
+  assert.equal(parseCommand("/invited"), null);
+  assert.equal(parseCommand("/membership"), null);
+  assert.equal(parseCommand("/kicked"), null);
 });
