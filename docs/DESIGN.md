@@ -35,6 +35,7 @@
 - `/status`、`/cost`、`/context` 是只读：读 `getSessionStats()`、`getContextUsage()`、`session.model`/`thinkingLevel`，不触发模型调用；无活跃会话时返回明确提示。`/status` 还展示 dream 覆盖计数、上次成功/尝试时间与记忆索引行数。
 - `/compact` 入 FIFO 并调用 Pi 原生 `session.compact(customInstructions?)`（其内部先 `abort()`），返回 `tokensBefore`/`estimatedTokensAfter`；上下文太小或已压缩会失败并给出通用提示，不向微信转发原始异常。
 - `/stop` 调用 `session.abort()`。因 SDK 串行派发消息，`/stop` 无法在一条 chat 尚未返回时插队中断它，只能中止后台 dream 或（若将来并发派发）正在运行的 turn；文案如实描述。
+- `/help` 返回静态的角色感知速查（不建会话、零 Pi 调用）：普通聊天无需指令与自省命令人人可见；owner 额外附管理命令行，成员回复完全省略管理块。
 
 持久映射使用 UUID intent：在 Pi 首次 prompt 前写 `state.json`；通过 `SessionManager.create(cwd, undefined, {id})` 创建相同 UUID。Pi 首个 user message 即创建 JSONL，不必等 assistant。恢复使用 `SessionManager.findById(cwd,id)` 和 `open(path,undefined,cwd)`，验证 ID；没有文件且未完成首轮时可用同一 ID 重建空 intent；已成功运行后文件缺失必须报错，不能偷偷续最近或开新会话。
 

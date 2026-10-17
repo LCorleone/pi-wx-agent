@@ -90,6 +90,8 @@ node dist/main.js start --config config.json
 | `/context` | 已授权 | 上下文占用 |
 | `/compact [说明]` | 已授权 | 手动压缩，走 Pi 原生 `compact()` |
 | `/stop` | 已授权 | 中止**自己会话**当前任务（受 SDK 串行限制） |
+| `/clear` | 已授权 | 清空当前会话上下文（保留工作区与记忆；SDK 自带，鉴权由桥接执行） |
+| `/help` | 已授权 | 命令速查；owner 额外列出管理命令，成员回复省略管理块 |
 | `/invite` | 仅 owner | 生成/轮换邀请码（再次调用作废旧码） |
 | `/members` | 仅 owner | 列出成员序号与加入时间 |
 | `/kick <序号>` | 仅 owner | 移除成员；**同时作废当前邀请码** |

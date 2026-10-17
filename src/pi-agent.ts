@@ -172,8 +172,8 @@ function sanitizeFileName(name: string | undefined): string {
   return base === "." || base === ".." ? "" : base;
 }
 
-export type SessionCommand = "status" | "cost" | "context" | "compact" | "stop" | "invite" | "members" | "kick";
-const SESSION_COMMANDS = new Set<string>(["status", "cost", "context", "compact", "stop", "invite", "members", "kick"]);
+export type SessionCommand = "status" | "cost" | "context" | "compact" | "stop" | "invite" | "members" | "kick" | "help";
+const SESSION_COMMANDS = new Set<string>(["status", "cost", "context", "compact", "stop", "invite", "members", "kick", "help"]);
 /** Commands only the owner (deployer) may use; members get a refusal, never a Pi call. */
 const OWNER_COMMANDS = new Set<string>(["invite", "members", "kick"]);
 /** A 24-hour multi-use invite window. */
@@ -184,6 +184,15 @@ const MEMBER_WELCOME = [
   "你的会话、工作区与记忆和其他成员完全隔离。可直接发送文字、图片、文件或语音；",
   "可用命令：/status /cost /context /compact /stop /clear（均只作用于你自己的会话）。",
 ].join("\n");
+
+/** Static /help reply, common part: plain chat needs no command, then session introspection. */
+const HELP_COMMON = [
+  "普通聊天（文字/图片/文件/语音）无需指令。",
+  "会话自省：/status 会话与记忆概况、/cost 用量统计、/context 上下文占用、/compact 手动压缩、/stop 中止自己会话的当前任务。",
+  "/clear 清空当前会话上下文（保留工作区与记忆）；/help 显示本帮助。",
+].join("\n");
+/** Management line appended to /help for the owner only; member replies omit it entirely. */
+const HELP_MANAGEMENT = "管理：/invite 生成/轮换家人邀请码、/members 成员列表、/kick <序号> 移除成员（作废当前邀请码）。";
 
 /** Recognize a bridge-handled command. The SDK intercepts /echo, /toggle-debug and /clear first. */
 export function parseCommand(text: string): { command: SessionCommand; args: string } | null {
@@ -592,6 +601,12 @@ export class PiAgent implements Agent {
         case "status": return { text: this.statusText(this.sessions.get(key), this.state.conversations[key], key) };
         case "cost": return { text: this.costText(this.sessions.get(key)) };
         case "context": return { text: this.contextText(this.sessions.get(key)) };
+        case "help": {
+          // Static, role-aware text on no session: zero Pi calls for anyone.
+          // Members see only the common block, so management capabilities
+          // are never described to people who cannot use them.
+          return { text: this.state.owner === key ? `${HELP_COMMON}\n${HELP_MANAGEMENT}` : HELP_COMMON };
+        }
       }
     } catch (error) {
       this.log(`Command failed; ${safeDiagnostic(error)}`);

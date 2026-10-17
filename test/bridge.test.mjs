@@ -932,7 +932,7 @@ test("A1 existing AGENTS.md is never overwritten and logs a migration note", asy
 test("A4 session commands require authorization and never reach Pi when unauthorized", async t => {
   const f = fixture(t);
   const agent = f.make();
-  for (const command of ["/status", "/cost", "/context", "/compact", "/stop", "/invite", "/members", "/kick 1"]) {
+  for (const command of ["/status", "/cost", "/context", "/compact", "/stop", "/invite", "/members", "/kick 1", "/help"]) {
     const response = await agent.chat(message(command, "stranger"));
     assert.equal(response.text, "未授权", `${command} must be rejected`);
   }
@@ -977,11 +977,13 @@ test("A4 authorized commands: status/cost/context/compact/stop", async t => {
 test("A4 command parsing is bridge-owned and ignores SDK-handled commands", t => {
   assert.deepEqual(parseCommand("/status"), { command: "status", args: "" });
   assert.deepEqual(parseCommand("  /Cost  "), { command: "cost", args: "" });
+  assert.deepEqual(parseCommand("  /Help  "), { command: "help", args: "" });
   assert.deepEqual(parseCommand("/compact  keep the decisions "), { command: "compact", args: "keep the decisions" });
   assert.equal(parseCommand("/echo hi"), null);
   assert.equal(parseCommand("/toggle-debug"), null);
   assert.equal(parseCommand("/clear"), null);
   assert.equal(parseCommand("/unknown"), null);
+  assert.equal(parseCommand("/helper"), null);
   assert.equal(parseCommand("hello"), null);
   assert.equal(parseCommand("/statuses"), null);
 });
@@ -1165,6 +1167,34 @@ test("management commands are owner-only; members keep session commands on their
   await agent.drain();
   assert.equal(sister.disposed, true);
   assert.equal(owner.disposed, false);
+  await agent.close();
+});
+
+test("/help is role-aware static text: owner sees management, members do not, no Pi call", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  // Unauthorized senders get the plain refusal, same as every other command:
+  // no capability leak, no session, zero Pi runs.
+  assert.equal((await agent.chat(message("/help", "stranger"))).text, "未授权");
+  assert.equal(f.sessions.length, 0, "unauthorized /help must not create a Pi session");
+  // Owner: the common block plus the management block.
+  await f.claim(agent);
+  const ownerHelp = (await agent.chat(message("/help"))).text;
+  assert.ok(ownerHelp.includes("/status"), "owner help lists session commands");
+  assert.ok(ownerHelp.includes("/compact"), "owner help lists /compact");
+  assert.ok(ownerHelp.includes("/invite"), "owner help lists management commands");
+  assert.ok(ownerHelp.includes("/kick"), "owner help lists /kick");
+  assert.match(ownerHelp, /普通聊天/);
+  // Member: the management block is omitted entirely.
+  const code = await inviteCode(agent);
+  assert.match((await agent.chat(message(code, "sister"))).text, /欢迎加入/);
+  const memberHelp = (await agent.chat(message("/help", "sister"))).text;
+  assert.ok(memberHelp.includes("/status"), "member help lists session commands");
+  assert.ok(!memberHelp.includes("/invite"), "member help must omit /invite");
+  assert.ok(!memberHelp.includes("/members"), "member help must omit /members");
+  assert.ok(!memberHelp.includes("/kick"), "member help must omit /kick");
+  // Static text on no session for every role: nothing ever reached Pi.
+  assert.equal(f.sessions.length, 0, "/help never creates a Pi session");
   await agent.close();
 });
 
