@@ -1,6 +1,10 @@
 import { mkdirSync } from "node:fs";
 import { loadConfig } from "./config.js";
 import { PiAgent } from "./pi-agent.js";
+import { installExtensionDisposalGuard } from "./extension-guard.js";
+
+// Before anything else: contain extension disposal races (see extension-guard.ts).
+installExtensionDisposalGuard();
 
 /**
  * pi's session factory installs its bundled undici as the global fetch implementation
