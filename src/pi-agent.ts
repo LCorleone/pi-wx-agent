@@ -282,7 +282,12 @@ export class PiAgent implements Agent {
   private readonly sessions = new Map<string, BridgeSession>();
   private tail: Promise<void> = Promise.resolve();
   private pending = 0;
-  private generation = 0;
+  /**
+   * Per-conversation epochs: `/clear` bumps ONLY the cleared conversation so another
+   * user's queued/running replies survive (documented per-session isolation). close()
+   * bumps every known key on top of the permanent closing flag.
+   */
+  private readonly epochs = new Map<string, number>();
   private closing = false;
   private unhealthy = false;
 
@@ -331,6 +336,12 @@ export class PiAgent implements Agent {
   private keyAuthorized(key: string): boolean {
     return key === this.state.owner || this.state.members[key] !== undefined;
   }
+
+  /** The current suppression epoch of one conversation (0 until its first /clear). */
+  private epochOf(key: string): number { return this.epochs.get(key) ?? 0; }
+
+  /** Invalidate every pending chat of ONE conversation (its own /clear, or shutdown). */
+  private bumpEpoch(key: string): void { this.epochs.set(key, (this.epochs.get(key) ?? 0) + 1); }
 
   /**
    * An unauthorized sender may join by sending exactly the active invite code.
@@ -592,9 +603,9 @@ export class PiAgent implements Agent {
       return { text: "该命令仅部署者可用。" };
     }
     if (command) return this.handleCommand(command.command, command.args, key, request.conversationId);
-    const generation = this.generation;
+    const epoch = this.epochOf(key);
     return this.enqueue(async () => {
-      if (generation !== this.generation || !this.authorized(request.conversationId)) return {};
+      if (epoch !== this.epochOf(key) || !this.authorized(request.conversationId)) return {};
       try {
         const session = await this.session(key);
         if (this.closing) return {};
@@ -607,7 +618,7 @@ export class PiAgent implements Agent {
         const reply = await session.run(prompt);
         record.started = true;
         this.save();
-        if (generation !== this.generation || this.closing) return {};
+        if (epoch !== this.epochOf(key) || this.closing) return {};
         // ATTACH first: the instructed order is MEMORY_SAVED lines then one final ATTACH
         // line, so claims are trailing only after the attach block is stripped.
         const { paths, stripped: withoutAttach } = parseAttachLines(reply);
@@ -626,7 +637,7 @@ export class PiAgent implements Agent {
         return media ? { text: final, media } : { text: final };
       } catch (error) {
         this.log(`Chat failed; ${safeDiagnostic(error)}`);
-        return generation === this.generation && !this.closing ? { text: "处理失败，请稍后重试或联系部署者检查日志与模型配置。" } : {};
+        return epoch === this.epochOf(key) && !this.closing ? { text: "处理失败，请稍后重试或联系部署者检查日志与模型配置。" } : {};
       }
     });
   }
@@ -765,7 +776,9 @@ export class PiAgent implements Agent {
       throw new Error("未授权"); // SDK catches synchronous slash-command failures.
     }
     const key = hash(conversationId);
-    this.generation++; // Suppress any pre-clear chat still waiting/running.
+    // Suppress ONLY this conversation's pre-clear chats (queued or running); another
+    // user's clear must never drop a different conversation's pending reply.
+    this.bumpEpoch(key);
     void this.enqueue(async () => {
       delete this.state.conversations[key];
       this.save(); // Durable reset first; never accidentally resume the old JSONL.
@@ -823,7 +836,10 @@ export class PiAgent implements Agent {
 
   async close(): Promise<void> {
     this.closing = true;
-    this.generation++;
+    // Shutdown suppresses everything pending: bump every known conversation epoch. The
+    // permanent closing flag already fails every check; this keeps that true even if a
+    // future change relies on epochs alone.
+    for (const key of new Set([...this.epochs.keys(), ...Object.keys(this.state.conversations)])) this.bumpEpoch(key);
     await Promise.allSettled([...this.sessions.values()].map(session => session.abort()));
     await this.tail;
     for (const session of this.sessions.values()) session.dispose();

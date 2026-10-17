@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { PiAgent, dreamDueAt, DREAM_PROMPT, MEMORY_INSTRUCTIONS, OWNER_EXTENSIONS_INSTRUCTIONS, parseAttachLines, parseCommand, parseSavedClaims, REMEMBER_INTENT, REMEMBER_INTENT_EN, attachMediaType, sniffImageMime } from "../dist/pi-agent.js";
 import { indexLineCount, readMemoryStore, sameMemoryStore, MEMORY_INDEX_MAX_LINES } from "../dist/memory.js";
@@ -675,6 +675,16 @@ test("dream boundary and config validation", t => {
     writeFileSync(file, JSON.stringify(bad));
     assert.throws(() => loadConfig(file), /Invalid config/);
   }
+});
+
+test("the shipped config.example.json is accepted by loadConfig as-is", () => {
+  const file = resolve("config.example.json");
+  const parsed = JSON.parse(readFileSync(file, "utf8"));
+  assert.equal(parsed.model, null, "example ships model:null (valid; deployers edit it after copying)");
+  const config = loadConfig(file);
+  assert.equal(config.dataDir, resolve("data"));
+  assert.equal(config.dream.enabled, true);
+  assert.equal(config.dream.hour, 3);
 });
 
 test("extensions config: optional, absolute-existing paths only; absent stays undefined", t => {
@@ -1405,6 +1415,47 @@ test("a kicked member's queued chat never runs and their dream is not scheduled"
   await agent.dream();
   assert.ok(!sister.calls.some(call => call === DREAM_PROMPT), "kicked member gets no dream");
   assert.deepEqual(brother.calls.filter(call => call === DREAM_PROMPT), [DREAM_PROMPT]);
+  await agent.close();
+});
+
+test("per-conversation epoch: a member's /clear never drops another user's pending reply", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  const code = await inviteCode(agent);
+  await agent.chat(message(code, "sister"));
+  await agent.chat(message("owner warmup"));
+  const owner = f.sessions.at(-1);
+  // Owner's turn is RUNNING when the member clears her own session: the reply must survive.
+  owner.gate = deferred();
+  owner.started = deferred();
+  const running = agent.chat(message("slow owner question"));
+  await owner.started.promise;
+  agent.clearSession("sister");
+  owner.gate.resolve();
+  assert.equal((await running).text, "reply:slow owner question", "member /clear must not drop the owner's running reply");
+  // The owner's QUEUED messages equally survive the member's clear (FIFO order intact).
+  owner.gate = deferred();
+  owner.started = deferred();
+  const first = agent.chat(message("first"));
+  await owner.started.promise;
+  const second = agent.chat(message("second"));
+  agent.clearSession("sister");
+  owner.gate.resolve();
+  assert.equal((await first).text, "reply:first");
+  assert.equal((await second).text, "reply:second");
+  // The member's OWN queued chat is still suppressed by her clear (per-key semantics).
+  owner.gate = deferred();
+  owner.started = deferred();
+  const ownerRun = agent.chat(message("owner busy"));
+  await owner.started.promise;
+  const sisterQueued = agent.chat(message("never mind", "sister"));
+  agent.clearSession("sister");
+  owner.gate.resolve();
+  assert.equal((await ownerRun).text, "reply:owner busy");
+  assert.deepEqual(await sisterQueued, {}, "the member's own queued chat stays suppressed");
+  assert.ok(f.sessions.every(s => s.cwd !== join(f.dataDir, "conversations", hash("sister"))),
+    "a suppressed member chat must not even create a session");
   await agent.close();
 });
 
