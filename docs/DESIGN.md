@@ -13,7 +13,7 @@
 
 微信 SDK 原生全局串行，但定时 dream 与同步 clear 回调不在同一异步生命周期，桥接必须共享一个 FIFO。支持一个 owner 与受邀成员（见「多用户家庭版」）与受限媒体通道（见「媒体收发」），不引 cron 库/数据库/外部模型提取管道。
 
-模块：`main.ts` 管配置/微信登录/停止/定时器，并安装 fetch 兼容垫片（见下）；`config.ts` 校验配置；`state.ts` 管可验证的原子持久状态；`memory.ts` 读写两层记忆（索引/topic、行数、原文核对）；`pi-agent.ts` 管认领/串行生命周期/命令/记忆规则/dream；`pi-session.ts` 适配并验证真实 Pi API。没有全局安装依赖。
+模块：`main.ts` 管配置/微信登录/停止/定时器，并安装 fetch 兼容垫片（见下）；`config.ts` 校验配置（含可选 `extensions` 扩展清单）；`state.ts` 管可验证的原子持久状态；`memory.ts` 读写两层记忆（索引/topic、行数、原文核对）；`pi-agent.ts` 管认领/串行生命周期/命令/记忆规则/dream；`pi-session.ts` 适配并验证真实 Pi API。没有全局安装依赖。
 
 ## 启动与 owner
 
@@ -48,6 +48,8 @@ clear 同步鉴权并递增代际编号，使尚未返回的旧 chat 回复/旧�
 ## 原生压缩与记忆
 
 `SettingsManager.applyOverrides({compaction:{enabled:true}})` **在 createAgentSession 完成后**执行；安装版本的 ResourceLoader.reload 会重载并丢弃提前设置的 overrides。立即检查 `session.autoCompactionEnabled`。不修改操作员全局设置，不另写摘要算法；阈值和摘要的正确性依赖 Pi/model。手动压缩（`/compact`）走同一 Pi 原生 `session.compact()`，不自研摘要。
+
+可选扩展（`config.extensions`，默认不配置）：数组内为绝对路径且启动时逐一校验存在，否则拒绝启动。非空时为每个会话构造 `DefaultResourceLoader({ additionalExtensionPaths, noExtensions: true })` 并先 `reload()` 再传入 `createAgentSession`（SDK 只 reload 自己构造的 loader）。安装版 resource-loader（reload()/loadCurrentExtensionSet()）的加载集合是 `noExtensions ? cliEnabledExtensions : mergePaths(cliEnabledExtensions, enabledExtensions)`，其中 cliEnabledExtensions 恰为 additionalExtensionPaths、enabledExtensions 为全局 settings/<agentDir>/extensions 与项目目录的自动发现结果；因此 `noExtensions: true` 把加载精确限制为清单内文件，跳过全部全局/用户/项目扩展发现。未配置时不传 resourceLoader，行为与引入该选项前逐位一致。配套可选 `extensionFlags`（须与非空 `extensions` 同用）双通道生效：一是在 reload 后写入 loader 结果的 `runtime.flagValues`（`getFlag()` 实时读取的同一映射，与 CLI 的 `applyExtensionFlagValues` 同机制；工厂期已随 reload 运行、标志无预置入口，扩展须惰性读标志），并补上 CLI 各模式均执行而 `createAgentSession` 不执行的 `session.bindExtensions()`（触发 `session_start`），使按标志惰性注册的工具真正生效；二是在 `createSessionFactory` 内、首个 loader.reload() 之前把令牌追加到 `process.argv`（布尔真 `--name`、字符串 `--name=value`、布尔假跳过——argv 只能表达存在性；含去重守卫，且晚于 main.ts 自身的参数解析，不影响命令分派），供工厂期扫描 argv 的扩展（文档化回退模式）识别；未注册标志名记一条警告。扩展与桥接同权限运行（可注册新工具）；可见性隔离靠 AGENTS.md 模板分支：仅当 `key === state.owner` 且清单非空时在模板末追加一段通用说明（不提工具/扩展名），成员模板不变。
 
 Pi 原生加载 cwd/父目录/agentDir 的 AGENTS 类 context 文件。项目的通用模板要求：
 

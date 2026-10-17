@@ -4,5 +4,7 @@
   "dream": {
     "enabled": true,
     "hour": 3
-  }
+  },
+  "extensions": [],
+  "extensionFlags": {}
 }

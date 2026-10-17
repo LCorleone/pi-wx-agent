@@ -44,6 +44,20 @@ other files; audio cannot be sent). Only paths inside this workspace are accepte
 If the same reply also saves memory, put MEMORY_SAVED lines BEFORE the ATTACH line.
 Extra ATTACH lines are ignored. Do not use the marker for anything else.
 `;
+
+/**
+ * Owner-only section appended to MEMORY_INSTRUCTIONS when the deployer configured
+ * `extensions`. Generic by design: it names no tool, extension, or path. Members keep
+ * the plain template, so extension-provided capabilities are surfaced only in the
+ * owner's conversation (see PiAgent.agentsTemplate).
+ */
+export const OWNER_EXTENSIONS_INSTRUCTIONS = `# Additional tools
+
+Beyond the standard tools, this workspace may also provide extra tools the deployer chose
+to enable. When a request fits one of them, or the user asks for such a capability, use it
+instead of declining. Treat them like any other tool and verify the result before claiming
+success.
+`;
 export const DREAM_PROMPT = `【例行反思】先读取 MEMORY.md（若存在）。MEMORY.md 是索引，每条一行；详情放 memory/<topic>.md，索引保持在约 150 行内，超出时把细节移入 topic 文件并按需读取。
 只回顾当前可见上下文和已有记忆，整理值得长期保留的事实：新增、纠错、合并重复、删除明确过时的条目。不猜测已压缩掉的原文，不记录凭据，也不记录临时文件路径、基础设施诊断或桥接实现细节等与用户无关的系统内部状态。
 使用文件工具更新记忆并检查结果；没有值得更新的内容可不修改。
@@ -307,6 +321,17 @@ export class PiAgent implements Agent {
   private workspace(key: string): string { return join(this.config.dataDir, "conversations", key); }
 
   /**
+   * Instructions written into a workspace. Extension-provided tools are scoped to the
+   * owner's conversation: only the owner's workspace template mentions them, and only
+   * when extensions are actually configured; members always get the plain template.
+   */
+  private agentsTemplate(key: string): string {
+    return this.state.owner === key && this.config.extensions?.length
+      ? MEMORY_INSTRUCTIONS + OWNER_EXTENSIONS_INSTRUCTIONS
+      : MEMORY_INSTRUCTIONS;
+  }
+
+  /**
    * Claims via MEMORY_SAVED that are not backed by a real write this turn. A claim is
    * verified when its text is present in the AFTER store AND the store changed during
    * the run (before != after). This accepts rewrites/merges/migrations of existing
@@ -444,13 +469,14 @@ export class PiAgent implements Agent {
     const cwd = this.workspace(key);
     mkdirSync(cwd, { recursive: true, mode: 0o700 });
     const agentsFile = join(cwd, "AGENTS.md");
-    try { writeFileSync(agentsFile, MEMORY_INSTRUCTIONS, { flag: "wx", mode: 0o600 }); }
+    const template = this.agentsTemplate(key);
+    try { writeFileSync(agentsFile, template, { flag: "wx", mode: 0o600 }); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       // Never overwrite an existing workspace's instructions. If they differ from the
       // current template, leave a migration note in the log rather than rewriting it.
       try {
-        if (readFileSync(agentsFile, "utf8") !== MEMORY_INSTRUCTIONS) {
+        if (readFileSync(agentsFile, "utf8") !== template) {
           this.log("Workspace AGENTS.md differs from the current template; not overwritten. Refresh it manually to adopt the latest memory and media conventions.");
         }
       } catch { /* unreadable existing file: leave it untouched */ }

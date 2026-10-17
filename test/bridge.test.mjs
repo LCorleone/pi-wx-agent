@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { PiAgent, dreamDueAt, DREAM_PROMPT, MEMORY_INSTRUCTIONS, parseAttachLines, parseCommand, parseSavedClaims, REMEMBER_INTENT, REMEMBER_INTENT_EN, attachMediaType, sniffImageMime } from "../dist/pi-agent.js";
+import { PiAgent, dreamDueAt, DREAM_PROMPT, MEMORY_INSTRUCTIONS, OWNER_EXTENSIONS_INSTRUCTIONS, parseAttachLines, parseCommand, parseSavedClaims, REMEMBER_INTENT, REMEMBER_INTENT_EN, attachMediaType, sniffImageMime } from "../dist/pi-agent.js";
 import { indexLineCount, readMemoryStore, sameMemoryStore, MEMORY_INDEX_MAX_LINES } from "../dist/memory.js";
 import { hash, readState } from "../dist/state.js";
 import { loadConfig } from "../dist/config.js";
@@ -659,6 +659,83 @@ test("dream boundary and config validation", t => {
     writeFileSync(file, JSON.stringify(bad));
     assert.throws(() => loadConfig(file), /Invalid config/);
   }
+});
+
+test("extensions config: optional, absolute-existing paths only; absent stays undefined", t => {
+  const f = fixture(t);
+  const file = join(f.dataDir, "config.json");
+  const base = { ...f.config, dataDir: "relative" };
+  writeFileSync(file, JSON.stringify(base));
+  assert.equal(loadConfig(file).extensions, undefined);
+  writeFileSync(file, JSON.stringify({ ...base, extensions: [] }));
+  assert.deepEqual(loadConfig(file).extensions, []);
+  const stub = join(f.dataDir, "extension-stub.js");
+  writeFileSync(stub, "// offline test stub, never imported here\n");
+  writeFileSync(file, JSON.stringify({ ...base, extensions: [stub] }));
+  assert.deepEqual(loadConfig(file).extensions, [stub]);
+  for (const bad of [
+    { ...base, extensions: "extension.js" },
+    { ...base, extensions: [42] },
+    { ...base, extensions: [""] },
+    { ...base, extensions: ["relative/extension.js"] },
+  ]) {
+    writeFileSync(file, JSON.stringify(bad));
+    assert.throws(() => loadConfig(file), /Invalid config/);
+  }
+  // A listed path that does not exist fails startup loudly, naming the path.
+  const missing = join(f.dataDir, "no-such-extension.js");
+  writeFileSync(file, JSON.stringify({ ...base, extensions: [missing] }));
+  assert.throws(() => loadConfig(file), error => {
+    assert.ok(error.message.includes(missing), "the error must name the missing path");
+    return true;
+  });
+  // extensionFlags: plain object of non-empty names to boolean/string values, extensions required.
+  writeFileSync(file, JSON.stringify({ ...base, extensions: [stub], extensionFlags: { "some-flag": true, "another": "value" } }));
+  assert.deepEqual(loadConfig(file).extensionFlags, { "some-flag": true, "another": "value" });
+  writeFileSync(file, JSON.stringify({ ...base, extensions: [stub] }));
+  assert.equal(loadConfig(file).extensionFlags, undefined);
+  for (const without of [{ ...base, extensionFlags: { "some-flag": true } }, { ...base, extensions: [], extensionFlags: { "some-flag": true } }]) {
+    writeFileSync(file, JSON.stringify(without));
+    assert.throws(() => loadConfig(file), /Invalid config: extensionFlags requires/);
+  }
+  for (const bad of [
+    { ...base, extensions: [stub], extensionFlags: ["some-flag"] },
+    { ...base, extensions: [stub], extensionFlags: { "some-flag": 1 } },
+    { ...base, extensions: [stub], extensionFlags: { "some-flag": null } },
+    { ...base, extensions: [stub], extensionFlags: { "some-flag": { on: true } } },
+    { ...base, extensions: [stub], extensionFlags: { "": true } },
+  ]) {
+    writeFileSync(file, JSON.stringify(bad));
+    assert.throws(() => loadConfig(file), /Invalid config/);
+  }
+});
+
+test("extensions are owner-scoped: only the owner workspace template mentions them", async t => {
+  // Default (no extensions configured): the owner workspace keeps the plain template.
+  const plain = fixture(t);
+  const plainAgent = plain.make();
+  await plain.claim(plainAgent);
+  await plainAgent.chat(message("hello"));
+  assert.equal(readFileSync(join(plain.dataDir, "conversations", hash("owner"), "AGENTS.md"), "utf8"), MEMORY_INSTRUCTIONS);
+  await plainAgent.close();
+
+  // With extensions configured, only the owner's template gains the generic section.
+  const f = fixture(t);
+  f.config.extensions = [join(f.dataDir, "extension-stub.js")]; // existence is loadConfig's job
+  const agent = f.make();
+  await f.claim(agent);
+  await agent.chat(message("hello"));
+  const owner = readFileSync(join(f.dataDir, "conversations", hash("owner"), "AGENTS.md"), "utf8");
+  assert.equal(owner, MEMORY_INSTRUCTIONS + OWNER_EXTENSIONS_INSTRUCTIONS);
+  assert.match(owner, /Additional tools/);
+  // A joined member's workspace keeps the plain template, with no mention of extras.
+  const code = await inviteCode(agent);
+  await agent.chat(message(code, "sister"));
+  await agent.chat(message("hi", "sister"));
+  const member = readFileSync(join(f.dataDir, "conversations", hash("sister"), "AGENTS.md"), "utf8");
+  assert.equal(member, MEMORY_INSTRUCTIONS);
+  assert.ok(!member.includes("Additional tools"));
+  await agent.close();
 });
 
 test("A2 memory write verification: chat verifies MEMORY_SAVED markers and strips them", async t => {
