@@ -9,13 +9,15 @@ export interface Config {
   extensions?: string[];
   /** Optional flag values the loaded extensions can read via pi.getFlag (requires extensions). */
   extensionFlags?: Record<string, boolean | string>;
+  /** Optional: forward externally-steered owner replies to WeChat (default: no push). */
+  pushExternalReplies?: boolean;
 }
 
 export function loadConfig(file: string): Config {
   const path = resolve(file);
   const value = JSON.parse(readFileSync(path, "utf8"));
   if (!value || typeof value !== "object" || Array.isArray(value) ||
-      Object.keys(value).some(key => !["dataDir", "model", "dream", "extensions", "extensionFlags"].includes(key)) ||
+      Object.keys(value).some(key => !["dataDir", "model", "dream", "extensions", "extensionFlags", "pushExternalReplies"].includes(key)) ||
       typeof value.dataDir !== "string" || !value.dataDir.trim() ||
       !(value.model === null || (value.model && typeof value.model.provider === "string" &&
         value.model.provider.trim() && typeof value.model.id === "string" && value.model.id.trim() &&
@@ -27,8 +29,9 @@ export function loadConfig(file: string): Config {
         value.extensions.every((extension: unknown) => typeof extension === "string" && extension.trim() && isAbsolute(extension)))) ||
       !(value.extensionFlags === undefined || (typeof value.extensionFlags === "object" && !Array.isArray(value.extensionFlags) &&
         Object.entries(value.extensionFlags).every(([name, flag]: [string, unknown]) => name.trim() !== "" &&
-          (typeof flag === "boolean" || typeof flag === "string"))))) {
-    throw new Error("Invalid config: expected dataDir, model: null or {provider,id}, dream: {enabled,hour:0..23}, extensions?: string[] of absolute paths, extensionFlags?: { [name]: boolean | string }");
+          (typeof flag === "boolean" || typeof flag === "string")))) ||
+      !(value.pushExternalReplies === undefined || typeof value.pushExternalReplies === "boolean")) {
+    throw new Error("Invalid config: expected dataDir, model: null or {provider,id}, dream: {enabled,hour:0..23}, extensions?: string[] of absolute paths, extensionFlags?: { [name]: boolean | string }, pushExternalReplies?: boolean");
   }
   // Flags are only read by loaded extensions; without any they can never take effect.
   if (value.extensionFlags !== undefined && !(Array.isArray(value.extensions) && value.extensions.length > 0)) {

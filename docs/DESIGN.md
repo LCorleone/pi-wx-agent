@@ -69,7 +69,7 @@ MEMORY 是磁盘文件，不是额外 LLM 提取流程；模型是否正确读�
 
 **出站（ATTACH 约定）**镜像 `MEMORY_SAVED` 协议：模型把文件写进会话工作区，回复末尾一行 `ATTACH: <工作区相对路径>`。解析顺序：先 `parseAttachLines`（只剥末尾连续、行首锚定的 ATTACH 行，与 `parseSavedClaims` 同构），再对剩余文本做 MEMORY_SAVED 解析——因此模型按「MEMORY_SAVED 行在前、ATTACH 行最后」的约定可同时剥离；顺序颠倒时 ATTACH 行不是末尾块、按普通文本发给用户（与中部 MEMORY_SAVED 同一已文档化取舍）。校验：`resolve(workspace, path)` 后对**两侧 `realpathSync`**（跟随符号链接）再做 `relative()` 越界检查（拒绝 `..`/绝对路径/指向工作区外的符号链接，断链落入 unreadable 拒绝），`statSync().isFile()`（拒绝目录与缺失）；按扩展名映射 `ChatResponse.media.type`（图片/视频扩展名→对应类型，其余→file）；`url` 传**绝对路径**（SDK 会把相对 url 相对自己 cwd 的 `path.resolve`）。失败：只剥标记、记 `category=attach-rejected reason=outside-workspace|unreadable|not-a-file`（固定词表，不回显路径），无附件。多条 ATTACH 只取第一条，多余记 `category=attach-dropped`。出站无音频、每回复最多一个附件（SDK 单对象限制）；SDK 上传时按文件真实 MIME 路由，类型映射仅为字段正确性。约定写入 `AGENTS.md` 模板；已有工作区不自动改写（日志提示手动刷新）。
 
-**进度反馈**：SDK 自带 typing 指示器覆盖 `agent.chat()` 全程（`process-message.ts:186-205` 先 `startTyping()` 再调 agent，每 10 秒 `setInterval` 续期，finally 取消），长任务无缺口。不引入 ack 消息、不调用 `Bot.sendMessage()`（维持不做主动推送决策）。
+**进度反馈**：SDK 自带 typing 指示器覆盖 `agent.chat()` 全程（`process-message.ts:186-205` 先 `startTyping()` 再调 agent，每 10 秒 `setInterval` 续期，finally 取消），长任务无缺口。不引入 ack 消息；默认不调用 `Bot.sendMessage()`（不做主动推送），唯一例外是可选开启的跨会话转述推送（见下文专节）。
 
 **入站去重（决策：不做）**：SDK 在派发消息前就持久化 get_updates 游标（`monitor.ts:113-117` 先 `saveGetUpdatesBuf` 落盘、`monitor.ts:120-131` 才进入消息循环调 `agent.chat()`），因此是 at-most-once：崩溃丢消息、不重放。无重放窗口 → 无需去重环，也未新增任何状态。边缘：若游标落盘本身失败（磁盘错误），同一批消息可能被重新拉取并再次派发——罕见重复窗口，桥接不做去重。
 
@@ -84,6 +84,17 @@ MEMORY 是磁盘文件，不是额外 LLM 提取流程；模型是否正确读�
 **管理命令（仅 owner；成员使用直接拒绝、不触 Pi）**：`/invite` 生成 128-bit 码、只存哈希、TTL 24h、再次生成即作废旧码；`/members` 按 joinedAt（哈希做稳定 tie-break）列出序号+加入时间，不显示哈希；`/kick <序号>` 按同一序号删除名册项（回复含该成员加入时间，便于核对序号错位），无效序号只提示不变更。被踢者下一条消息回到未授权；**已在 FIFO 排队的消息也不会执行**（入队闭包会重跑 authorized），其待 dream 活动也不再被调度（dream 循环按 `keyAuthorized` 过滤，避免 owner 为已移除者付模型费）；**踢人同时把 `invite` 置空作废当前码**——被踢者聊天记录里的旧码最多还有 24h 有效，不轮换即可原码静默重新加入；未完成加入的家人需重新 `/invite`。其工作区/会话映射保留，重新邀请后原会话精确恢复（踢人不是擦除）。
 
 **/stop 归属（多用户必须）**：会话表按 `hash(conversationId)` 键控，`/stop` 的中止目标永远是**发送者自己的会话**——结构上不可能中止别人的 chat 或 dream；发送者自己没有会话时回复说明而非动作。SDK 串行派发不变，故 /stop 只能中止自己会话的后台 dream（或将来并发派发时自己正在跑的 turn）。已有 `/stop` 对 dream 的中止语义保留，仅限自己的会话。
+
+## 跨会话转述推送（可选）
+
+`pushExternalReplies`（默认缺省即不推送）开启后，owner 会话中被**其它 Pi 会话**（经控制类扩展）触发的回合完成后，其最终回复文本经 `Bot.sendMessage` 转发到部署者微信——否则这些回复没有任何微信出口，部署者只能下次发消息时才看到。
+
+- **单一漏斗**：与扩展 owner 隔离同一判定——`session()` 创建会话时 `state.owner === key` 才可能安装钩子，且须同时满足配置标志与已设置的 `pushChannel`；成员会话与未配置部署结构性不安装钩子（fail-closed）。`pushChannel` 是 `PiAgent` 的可选属性，由 `main.ts` 在 `weixin.start()` 之后按配置安装（`text => bot.sendMessage(text)`；SDK 保持动态导入，无循环依赖；安装先于任何会话创建——会话都是懒创建的）。
+- **机制**（`wrapSession`）：会话**生命周期**订阅 assistant `message_end`，配合 busy 计数（`run()` 与 `compact()` 全程持有；dream 走 `run()` 故永不推送）。仅在空闲（busy=0）时收到 `stopReason==="stop"` 的 assistant 完成事件才触发钩子。`stopReason` 过滤是必须的：pi-agent-core 的循环对**每段** assistant 消息都发 message_end（中间工具调用段 stopReason 为 `toolUse`），不过滤就会把一次外部回合拆成多次推送；错误/中止/截断同样不推。
+- **与 FIFO 串行化的交互**：桥接自身的所有回合（聊天、dream、`/compact`）都在 FIFO 内通过 `run()`/`compact()` 驱动，busy 计数覆盖各自的完整窗口；单线程事件循环保证标志不会被中途观察到。外部指挥若落在桥接回合窗口内：其完成事件要么被 busy 压制（**绝不回合中途推送**），要么（若 Pi 把它排队到本轮 agent run 内消化）根本不会产生独立的空闲 message_end——那条文本由聊天回复路径送达。外部回合在桥接空闲时完成则正常推送一次。
+- **文本处理**：与聊天回复同一剥离管线（先 ATTACH 后 MEMORY_SAVED，仅末尾锚定块，中间提及原样保留）；外部回合的 ATTACH 无法携带文件（此路径无 ChatResponse 媒体对象），只剥标记不附任何文件；剥离后为空则不推。外部回合不做记忆写后校验（无运行前快照可对照），只剥离标记。
+- **失败兜底**：`pushChannel` 以 fire-and-forget 调用，同步抛出与 Promise 拒绝一律吞掉并记 `category=push-failed` 日志（经 `safeDiagnostic` 分类，不回显原始错误文本）；微信 SDK 无缓存 `context_token` 时 `Bot.sendMessage` 直接抛错（「没有找到 context_token，…」，内部 `contextToken is required` 断言在此路径上不可达，仍作兼容备选匹配），属正常冷启动，仅每进程记一次。推送失败不影响聊天流。
+- **平台边界**：push 只可能指向 owner——Bot 实例只服务部署者的单一微信账号（鉴权顺序不变）；`context_token` 只被**部署者本人**的入站消息预热（Bot 按登录账号持有者的固定键 `accountId:userId` 读取，入站按发送者写入各自键，成员消息不写入 Bot 读取的键），约 24h 过期、每令牌约 10 条，超限静默丢弃，故推送是尽力而为、不重投、不新增任何状态文件或定时器。
 
 ## Dream 调度
 
@@ -121,10 +132,10 @@ Pi 在部分安装形态下会把自己携带的新版 undici 装成全局 fetch
 
 `PI_CODING_AGENT_DIR` 可改 Pi 根。完整备份还需配置和私有环境变量；只备份 data 不够。恢复默认保持 dataDir 绝对路径，以维持 Pi cwd 编码目录；迁移路径必须人工核对。状态写同目录临时文件、fsync、rename、目录 fsync；文件 600，目录 700。没有承诺横跨 Pi JSONL 与 bridge JSON 的分布式事务。
 
-systemd 仅提供可编辑非 root 示例，不自动安装；先手动认证/扫码/认领。Pi 能执行 shell，cwd 不是沙箱，默认全局资源会被原生发现。SDK 会在桥接授权之前处理 echo/debug 和下载附件；不调用 Pi 但有 I/O/日志风险。不做主动推送、多个 owner、沙箱或持久消息重投队列；媒体仅限上文受限通道（无音频出站、无视频入模、无 OCR/转写自研）。
+systemd 仅提供可编辑非 root 示例，不自动安装；先手动认证/扫码/认领。Pi 能执行 shell，cwd 不是沙箱，默认全局资源会被原生发现。SDK 会在桥接授权之前处理 echo/debug 和下载附件；不调用 Pi 但有 I/O/日志风险。默认不做主动推送（可选跨会话转述推送除外）、不做多个 owner、沙箱或持久消息重投队列；媒体仅限上文受限通道（无音频出站、无视频入模、无 OCR/转写自研）。
 
 ## 验证边界
 
-离线测试覆盖 fake session/clock/temp dir 下的授权、一次性码预算、故障拒绝、路径、精确恢复/clear、并发、午夜/离线/忙/失败 dream、关闭和新鲜回复识别；写后校验（成功/失败/仅提及标记/带尾注/列表项/topic 命中/重复要求已有事实/无标记）、命令式记住匹配、dream 幂等与漏跑检测、自省命令鉴权与行为（含 /stop 确实调用 abort）、记忆索引超限、非目录 memory 路径；入站图片与文件/视频统一复制到 media/ 并以路径注记（媒体字节不进提示词；图片扩展名由魔数嗅探补充、未知保持 .bin）、复制失败降级（chat 不中断、无路径泄漏）、文件/视频复制与路径注记（含重名后缀、恶意文件名、源缺失降级）、语音透传（有字/无字）、ATTACH 解析单测与集成（有效 image/video/file、越界/绝对路径/目录/缺失/符号链接逃逸拒绝、多条取舍、与 MEMORY_SAVED 组合及顺序颠倒取舍）；多用户家庭版（邀请加入/过期/轮换/未认领不收人、管理命令仅 owner、/members //kick 序号与重编号、被踢者排队消息不执行且不再 dream、成员工作区/媒体/MEMORY 隔离、/stop 只中止自己的会话含 dream、旧 state.json 无感升级、新字段严格校验）；额外实际安装 SDK 测试只在隔离临时 HOME/agentDir 构建会话/JSONL、不 prompt，验证 AGENTS 注入、UUID 恢复和压缩开关。
+离线测试覆盖 fake session/clock/temp dir 下的授权、一次性码预算、故障拒绝、路径、精确恢复/clear、并发、午夜/离线/忙/失败 dream、关闭和新鲜回复识别；写后校验（成功/失败/仅提及标记/带尾注/列表项/topic 命中/重复要求已有事实/无标记）、命令式记住匹配、dream 幂等与漏跑检测、自省命令鉴权与行为（含 /stop 确实调用 abort）、记忆索引超限、非目录 memory 路径；入站图片与文件/视频统一复制到 media/ 并以路径注记（媒体字节不进提示词；图片扩展名由魔数嗅探补充、未知保持 .bin）、复制失败降级（chat 不中断、无路径泄漏）、文件/视频复制与路径注记（含重名后缀、恶意文件名、源缺失降级）、语音透传（有字/无字）、ATTACH 解析单测与集成（有效 image/video/file、越界/绝对路径/目录/缺失/符号链接逃逸拒绝、多条取舍、与 MEMORY_SAVED 组合及顺序颠倒取舍）；多用户家庭版（邀请加入/过期/轮换/未认领不收人、管理命令仅 owner、/members //kick 序号与重编号、被踢者排队消息不执行且不再 dream、成员工作区/媒体/MEMORY 隔离、/stop 只中止自己的会话含 dream、旧 state.json 无感升级、新字段严格校验）；跨会话转述推送（wrapSession 钩子契约：仅空闲+最终完成（stopReason=stop）触发、run/compact 窗口内事件全压制、多文本块拼接；PiAgent 接线：owner 专属、配置标志与通道双重门、成员/未配置/无通道结构性不装钩子、聊天/dream/压缩期间不推、MEMORY_SAVED/ATTACH 剥离与剥离后为空不推、同步抛/拒绝/冷启动全兜底且日志不泄漏原始错误、冷启动仅每进程一次、聊天不受影响；配置严格校验）；额外实际安装 SDK 测试只在隔离临时 HOME/agentDir 构建会话/JSONL、不 prompt，验证 AGENTS 注入、UUID 恢复和压缩开关。
 
 人工验收仍必需：微信 QR/真实文字往返、真实图片往返（发送→模型描述）、真实 ATTACH 文件往返、真实长上下文自动压缩、MEMORY 写入/读取质量、`MEMORY_SAVED` 标记在真实模型下的可靠性、真实 dream 后文件变化及无微信反思回复、真实 `/status` `/cost` `/context` `/compact` `/stop` 往返。详见 README。

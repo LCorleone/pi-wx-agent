@@ -6,5 +6,6 @@
     "hour": 3
   },
   "extensions": [],
-  "extensionFlags": {}
+  "extensionFlags": {},
+  "pushExternalReplies": false
 }

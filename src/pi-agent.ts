@@ -235,6 +235,14 @@ export interface BridgeSession {
   introspect(): SessionIntrospection;
   compact(customInstructions?: string): Promise<CompactionResult>;
   dispose(): void;
+  /**
+   * Optional external-reply hook: fires with the assembled text when a COMPLETED
+   * assistant message ends a turn the bridge itself did not initiate (e.g. another Pi
+   * session steering this one through a control extension). Implementations must
+   * suppress the hook while a bridge-driven run()/compact() is in flight. Absent =>
+   * never pushes.
+   */
+  setExternalReplyHook?(hook: (text: string) => void): void;
 }
 /**
  * Creates (or resumes) the Pi session for a conversation workspace. `opts.owner` gates
@@ -253,6 +261,22 @@ export function dreamDueAt(activity: number, hour: number): number {
 
 const fmt = (value: number): string => value.toLocaleString("en-US");
 
+/** True when a push failure is the WeChat SDK's no-cached-context_token cold start: Bot.sendMessage
+ *  throws FIRST with its user-facing message ("没有找到 context_token，…") when no token is
+ *  cached for the account holder — the later internal sendMessageWeixin assertion
+ *  ("contextToken is required") is unreachable from this path but kept as an alternative.
+ *  The token Bot reads is warmed only by the DEPLOYER'S OWN inbound messages (keyed by
+ *  the fixed account-holder id; member traffic writes other keys). Matched by message
+ *  text only to classify; the text itself is never logged. */
+function isColdStartPushFailure(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const message = String((error as { message?: unknown }).message ?? "");
+  return /没有找到 context_token/.test(message) || /contextToken is required/i.test(message);
+}
+
+/** Cold-start push failures logged so far: a normal per-deployment condition, logged at most once per process. */
+let coldStartPushLogged = false;
+
 export class PiAgent implements Agent {
   private state: State;
   private readonly sessions = new Map<string, BridgeSession>();
@@ -261,6 +285,15 @@ export class PiAgent implements Agent {
   private generation = 0;
   private closing = false;
   private unhealthy = false;
+
+  /**
+   * Optional WeChat outlet for external-steered owner replies (see setExternalReplyHook).
+   * When configured together with `pushExternalReplies`, an owner-session turn the bridge
+   * did not initiate is relayed here, fire-and-forget; every failure is logged and
+   * contained and can never affect the chat flow. Push only ever targets the owner —
+   * the single WeChat account this Bot instance serves.
+   */
+  pushChannel?: (text: string) => void | Promise<void>;
 
   constructor(
     private readonly config: Config,
@@ -497,7 +530,38 @@ export class PiAgent implements Agent {
     }
     const session = await this.createSession(cwd, record, { owner: this.state.owner === key });
     this.sessions.set(key, session);
+    // Cross-session relay push: the same single funnel as the extensions gate (owner key at
+    // session creation), additionally gated by the config flag and an installed channel.
+    // Members and unconfigured deployments never wire the hook at all.
+    if (this.config.pushExternalReplies && this.state.owner === key && this.pushChannel) {
+      session.setExternalReplyHook?.(text => this.pushExternalReply(text));
+    }
     return session;
+  }
+
+  /**
+   * Relay one externally-steered owner reply to WeChat. Strips the same trailing marker
+   * blocks as chat replies; an ATTACH marker from an external turn cannot carry the file
+   * (no ChatResponse media on this path), so the line is stripped and nothing attached.
+   * Empty text after stripping pushes nothing. Fire-and-forget with full containment:
+   * sync throws, rejections and SDK cold-start (no cached context_token yet) are logged
+   * (cold start at most once per process) and swallowed.
+   */
+  private pushExternalReply(raw: string): void {
+    const text = parseSavedClaims(parseAttachLines(raw).stripped).stripped;
+    if (!text) return;
+    void Promise.resolve()
+      .then(() => this.pushChannel?.(text))
+      .catch(error => {
+        if (isColdStartPushFailure(error)) {
+          if (!coldStartPushLogged) {
+            coldStartPushLogged = true;
+            this.log("External push failed; category=push-failed reason=no-context-token (normal cold start until the first inbound WeChat message caches one).");
+          }
+          return;
+        }
+        this.log(`External push failed; category=push-failed ${safeDiagnostic(error).replace(/^category=/, "reason=")}.`);
+      });
   }
 
   async chat(request: ChatRequest): Promise<ChatResponse> {

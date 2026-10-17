@@ -41,6 +41,55 @@ test("reply wrapper rejects old text, handled prompts, error/abort/length; uses 
   await assert.rejects(wrapped.run("input"), /busy/);
 });
 
+test("wrapSession external-reply hook: only completed assistant turns outside run()/compact() fire it", async () => {
+  // Real dispatcher semantics: every live subscription receives every event (a run's
+  // own subscription coexists with the lifetime one; unsubscribing removes just itself).
+  const listeners = new Set();
+  const emit = event => { for (const fn of [...listeners]) fn(event); };
+  const fake = {
+    isIdle: true,
+    subscribe(fn) { listeners.add(fn); return () => { listeners.delete(fn); }; },
+    async prompt() {
+      // An external turn finishing while the bridge run is still in flight.
+      emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "mid-run external" }] } });
+      await gated;
+      emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "run reply" }] } });
+    },
+    async abort() {},
+    async compact() {
+      emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "compaction emission" }] } });
+      return { summary: "s", firstKeptEntryId: "x", tokensBefore: 10, estimatedTokensAfter: 5 };
+    },
+    dispose() {},
+  };
+  let release;
+  const gated = new Promise(done => { release = done; });
+  const wrapped = wrapSession(fake);
+  const fired = [];
+  wrapped.setExternalReplyHook(text => fired.push(text));
+  // Non-completed segments, other roles and non-stop reasons never fire the hook.
+  emit({ type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "tool segment" }] } });
+  emit({ type: "message_end", message: { role: "assistant", stopReason: "error", content: [] } });
+  emit({ type: "message_end", message: { role: "user", stopReason: "stop", content: [{ type: "text", text: "user echo" }] } });
+  assert.deepEqual(fired, []);
+  // An idle completed external turn fires once, with text blocks joined.
+  emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "part one" }, { type: "text", text: "part two" }] } });
+  assert.deepEqual(fired, ["part one\npart two"]);
+  // A bridge run: the mid-run event is suppressed synchronously (busy flag), the run's
+  // own reply never reaches the hook either.
+  const run = wrapped.run("input");
+  assert.deepEqual(fired, ["part one\npart two"], "message_end landing mid-run must not push");
+  release();
+  assert.equal(await run, "run reply");
+  assert.deepEqual(fired, ["part one\npart two"], "the bridge's own reply must not push");
+  // Compaction emissions are suppressed for the whole compact() window.
+  await wrapped.compact();
+  assert.deepEqual(fired, ["part one\npart two"], "compaction must not push");
+  // Back to idle: external turns fire again.
+  emit({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "after compact" }] } });
+  assert.deepEqual(fired, ["part one\npart two", "after compact"]);
+});
+
 test("installed Pi API: exact JSONL identity, lazy intent recovery, native compaction and AGENTS injection (no model calls)", async () => {
   try {
     const cwd = join(root, "workspace");

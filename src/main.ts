@@ -98,6 +98,13 @@ async function main(): Promise<void> {
     }
     const bridge = agent;
     const bot = weixin.start(bridge, { abortSignal: controller.signal });
+    // Optional cross-session relay (pushExternalReplies): forward owner-session replies to
+    // turns the bridge did not initiate to the owner's WeChat. Bot.sendMessage needs a
+    // context_token cached from a prior inbound message (~24h validity), so pushes before
+    // the first inbound message simply fail and are logged inside PiAgent. Push targets
+    // only the owner: the single WeChat account this Bot instance serves. Wiring after
+    // start() keeps the SDK dynamically imported and avoids import cycles.
+    if (config.pushExternalReplies) bridge.pushChannel = text => bot.sendMessage(text);
     const dream = () => { void bridge.dream().catch(() => console.error("Dream scheduling failed.")); };
     timer = setInterval(dream, 60_000);
     dream();

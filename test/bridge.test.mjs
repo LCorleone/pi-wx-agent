@@ -25,9 +25,11 @@ function fixture(t, hour = 3) {
     const session = {
       cwd, id: record.sessionId, owner: opts?.owner, isIdle: true, calls: [], imageCalls: [], disposed: false,
       gate: undefined, started: deferred(), fail: false, compactCalls: 0, abortCalls: 0,
+      hook: undefined, busy: false,
       async run(text, images) {
         assert.equal(this.isIdle, true, "no overlapping prompts");
         this.isIdle = false;
+        this.busy = true;
         this.calls.push(text);
         this.imageCalls.push(images ?? []);
         this.started.resolve();
@@ -35,9 +37,16 @@ function fixture(t, hour = 3) {
           if (this.gate) await this.gate.promise;
           if (this.fail) throw new Error("fake failure");
           return `reply:${text}`;
-        } finally { this.isIdle = true; }
+        } finally { this.isIdle = true; this.busy = false; }
       },
       async abort() { this.abortCalls++; this.gate?.resolve(); },
+      // Mirrors wrapSession's external-reply contract (see pi-session.ts): only a
+      // COMPLETED assistant message landing while no bridge run()/compact() is in
+      // flight reaches an installed hook; stopReason "stop" gates tool-use segments.
+      external(text, stopReason = "stop") {
+        if (!this.busy && this.hook && stopReason === "stop") this.hook(text);
+      },
+      setExternalReplyHook(fn) { this.hook = fn; },
       introspect() {
         return {
           model: { provider: "test", id: "model", contextWindow: 1000 },
@@ -51,7 +60,14 @@ function fixture(t, hour = 3) {
           contextUsage: { tokens: 100, contextWindow: 1000, percent: 10 },
         };
       },
-      async compact() { this.compactCalls++; return { summary: "s", firstKeptEntryId: "x", tokensBefore: 500, estimatedTokensAfter: 120 }; },
+      async compact() {
+        this.compactCalls++;
+        this.busy = true;
+        try {
+          if (this.gate) await this.gate.promise;
+          return { summary: "s", firstKeptEntryId: "x", tokensBefore: 500, estimatedTokensAfter: 120 };
+        } finally { this.busy = false; }
+      },
       dispose() { this.disposed = true; },
     };
     sessions.push(session);
@@ -707,6 +723,27 @@ test("extensions config: optional, absolute-existing paths only; absent stays un
   ]) {
     writeFileSync(file, JSON.stringify(bad));
     assert.throws(() => loadConfig(file), /Invalid config/);
+  }
+});
+
+test("pushExternalReplies config: optional boolean; anything else rejects startup", t => {
+  const f = fixture(t);
+  const file = join(f.dataDir, "config.json");
+  const base = { ...f.config, dataDir: "relative" };
+  writeFileSync(file, JSON.stringify(base));
+  assert.equal(loadConfig(file).pushExternalReplies, undefined, "absent stays undefined (default: no push)");
+  writeFileSync(file, JSON.stringify({ ...base, pushExternalReplies: true }));
+  assert.equal(loadConfig(file).pushExternalReplies, true);
+  writeFileSync(file, JSON.stringify({ ...base, pushExternalReplies: false }));
+  assert.equal(loadConfig(file).pushExternalReplies, false);
+  for (const bad of [
+    { ...base, pushExternalReplies: "yes" },
+    { ...base, pushExternalReplies: 1 },
+    { ...base, pushExternalReplies: null },
+    { ...base, pushExternalReplies: [] },
+  ]) {
+    writeFileSync(file, JSON.stringify(bad));
+    assert.throws(() => loadConfig(file), /Invalid config/, JSON.stringify(bad));
   }
 });
 
@@ -1580,5 +1617,169 @@ test("owner flag reaches the session factory per conversation (extension gating)
   assert.equal(f.sessions.at(-1).owner, false, "a member's conversation must not");
   // An unclaimed deployment cannot create sessions anyway, but the flag stays fail-closed:
   // dream for the same keys flows through the same session() plumbing.
+  await agent.close();
+});
+
+// Flushes the fire-and-forget push microtask chain (then -> channel -> catch).
+const flushed = () => new Promise(resolve => setImmediate(resolve));
+
+test("pushExternalReplies: idle external turn pushes stripped text once; busy run/compact/dream never push", async t => {
+  const f = fixture(t);
+  f.config.pushExternalReplies = true;
+  const agent = f.make();
+  const pushed = [];
+  agent.pushChannel = text => { pushed.push(text); };
+  await f.claim(agent);
+  await agent.chat(message("hello"));
+  const session = f.sessions[0];
+  assert.equal(typeof session.hook, "function", "flag on + owner + channel: the hook must be wired");
+  // Idle external steer: markers are stripped exactly like chat replies; one turn, one push.
+  session.external("外部回答\nMEMORY_SAVED: 记了一条\nATTACH: media/x.png");
+  await flushed();
+  assert.deepEqual(pushed, ["外部回答"]);
+  // An ATTACH line from an external turn is stripped and NEVER attaches anything.
+  session.external("请看文件\nATTACH: media/report.pdf");
+  await flushed();
+  assert.deepEqual(pushed, ["外部回答", "请看文件"]);
+  // Only trailing marker lines are stripped; prose mentioning a marker stays byte-identical.
+  session.external("我说 MEMORY_SAVED: 但这只是引用");
+  await flushed();
+  assert.deepEqual(pushed, ["外部回答", "请看文件", "我说 MEMORY_SAVED: 但这只是引用"]);
+  // Nothing left after stripping -> no push at all.
+  session.external("MEMORY_SAVED: 只剩标记");
+  session.external("ATTACH: only-an-attach.txt");
+  await flushed();
+  assert.equal(pushed.length, 3);
+  // Tool-use / error segments of an external turn never fire the hook.
+  session.external("intermediate", "toolUse");
+  session.external("failed", "error");
+  assert.equal(pushed.length, 3);
+  // Mid-chat-run external completion is suppressed (busy flag held for the whole run).
+  session.gate = deferred();
+  session.started = deferred();
+  const chat = agent.chat(message("slow"));
+  await session.started.promise;
+  session.external("中途插入");
+  session.gate.resolve();
+  assert.equal((await chat).text, "reply:slow");
+  await flushed();
+  assert.equal(pushed.length, 3, "no push while the bridge's own turn is running");
+  // Mid-compact is suppressed too.
+  session.gate = deferred();
+  const compacting = agent.chat(message("/compact"));
+  await new Promise(resolve => setImmediate(resolve)); // compact() entered inside the FIFO
+  assert.equal(session.busy, true);
+  session.external("压缩中插入");
+  session.gate.resolve();
+  assert.match((await compacting).text, /已压缩/);
+  await flushed();
+  assert.equal(pushed.length, 3, "no push during compaction");
+  // Mid-dream is suppressed (dream runs through run()).
+  f.setNow(new Date(2026, 9, 16, 3, 1).getTime());
+  session.gate = deferred();
+  session.started = deferred();
+  const dream = agent.dream();
+  await session.started.promise;
+  session.external("梦中插入");
+  session.gate.resolve();
+  await dream;
+  await flushed();
+  assert.equal(pushed.length, 3, "dream replies must never push");
+  // After everything settles the session is idle again: pushes resume.
+  session.external("恢复正常");
+  await flushed();
+  assert.deepEqual(pushed, ["外部回答", "请看文件", "我说 MEMORY_SAVED: 但这只是引用", "恢复正常"]);
+  await agent.close();
+});
+
+test("push wiring is owner-only and flag-gated: members, flag off and channel-less sessions never push", async t => {
+  // Flag off: the hook is never wired even for the owner with a channel installed.
+  const off = fixture(t);
+  const agentOff = off.make();
+  agentOff.pushChannel = () => { throw new Error("must never be called"); };
+  await off.claim(agentOff);
+  await agentOff.chat(message("hello"));
+  assert.equal(off.sessions[0].hook, undefined, "flag off: no hook is installed at all");
+  off.sessions[0].external("外部回答");
+  assert.equal(off.sessions[0].hook, undefined);
+  await agentOff.close();
+
+  // Flag on but no channel yet: still no hook (main.ts wires the channel before any session exists).
+  const bare = fixture(t);
+  bare.config.pushExternalReplies = true;
+  const agentBare = bare.make();
+  await bare.claim(agentBare);
+  await agentBare.chat(message("hello"));
+  assert.equal(bare.sessions[0].hook, undefined, "no channel: no hook");
+  await agentBare.close();
+
+  // Flag on, member conversation: the member's session never wires the hook (same
+  // single funnel as the extensions gate: state.owner === key at session creation).
+  const f = fixture(t);
+  f.config.pushExternalReplies = true;
+  const agent = f.make();
+  agent.pushChannel = () => { throw new Error("must never be called"); };
+  await f.claim(agent);
+  const code = await inviteCode(agent);
+  await agent.chat(message(code, "sister"));
+  await agent.chat(message("hi", "sister"));
+  const sister = f.sessions.at(-1);
+  assert.equal(sister.owner, false);
+  assert.equal(sister.hook, undefined, "member sessions must never install the push hook");
+  sister.external("成员外部回复");
+  await flushed();
+  // The owner's session on the same deployment still pushes.
+  await agent.chat(message("owner turn"));
+  const owner = f.sessions.at(-1);
+  assert.notEqual(owner, sister, "the owner's session is distinct from the member's");
+  assert.equal(typeof owner.hook, "function");
+  const pushed = [];
+  agent.pushChannel = text => { pushed.push(text); };
+  owner.external("owner 外部回复");
+  await flushed();
+  assert.deepEqual(pushed, ["owner 外部回复"]);
+  await agent.close();
+});
+
+test("push failures are fully contained: sync throw, rejection and cold start log and never break chat", async t => {
+  const f = fixture(t);
+  f.config.pushExternalReplies = true;
+  const agent = f.make();
+  // The channel must exist at session creation for the hook to wire (main.ts installs it
+  // before any session exists); pushExternalReply reads the CURRENT channel at call time.
+  agent.pushChannel = () => {};
+  await f.claim(agent);
+  await agent.chat(message("hello"));
+  const session = f.sessions[0];
+  // A synchronous throw and a rejected promise each log one fixed-category line.
+  agent.pushChannel = () => { throw new Error("boom"); };
+  session.external("one");
+  await flushed();
+  agent.pushChannel = () => Promise.reject(new Error("nope"));
+  session.external("two");
+  await flushed();
+  const failures = f.logs.filter(line => line.includes("category=push-failed"));
+  assert.equal(failures.length, 2);
+  assert.ok(failures.every(line => !line.includes("boom") && !line.includes("nope")), "raw error text never reaches logs");
+  assert.equal(failures.filter(line => line.includes("reason=no-context-token")).length, 0);
+  // The SDK's REAL cold-start throw (Bot.sendMessage, bot.ts): no context_token cached for
+  // the account holder yet — the exact string the installed SDK produces. Normal per
+  // deployment, logged at most once per process: the dedup must fire on the FIRST such
+  // failure and stay silent on every subsequent one (same process), in either shape.
+  const coldStart = () => new Error("没有找到 context_token，需要在 start() 运行期间至少收到过一条消息");
+  assert.equal(f.logs.filter(line => line.includes("reason=no-context-token")).length, 0);
+  agent.pushChannel = () => Promise.reject(coldStart());
+  session.external("three");
+  await flushed();
+  assert.equal(f.logs.filter(line => line.includes("reason=no-context-token")).length, 1, "dedup logs the first cold-start failure");
+  session.external("four");
+  await flushed();
+  agent.pushChannel = () => { throw coldStart(); }; // sync-throw variant: equally silent
+  session.external("five");
+  await flushed();
+  assert.equal(f.logs.filter(line => line.includes("reason=no-context-token")).length, 1, "subsequent cold-start failures stay silent");
+  // Chat is completely unaffected by push failures.
+  assert.equal((await agent.chat(message("still alive"))).text, "reply:still alive");
+  assert.equal(f.logs.filter(line => line.includes("category=push-failed")).length, 3, "two generic + one cold-start line, nothing else leaked in");
   await agent.close();
 });

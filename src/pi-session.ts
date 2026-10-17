@@ -8,10 +8,30 @@ import type { BridgeSession, SessionFactory, SessionIntrospection } from "./pi-a
 
 /** Only completed assistant events from THIS prompt may become a WeChat reply. */
 export function wrapSession(session: AgentSession): BridgeSession {
+  // External-reply hook: a LIFETIME subscription that fires when a completed assistant
+  // message (stopReason "stop") ends a turn the bridge itself did not initiate — e.g.
+  // another Pi session steering this one through a control extension. Two guards make
+  // bridge-initiated activity invisible to the hook:
+  // - `busyDepth` is held for the ENTIRE duration of run() and compact() (every
+  //   bridge-driven window; dream goes through run(), so dreams never push), so the
+  //   bridge's own chat replies, dream replies and compaction emissions are suppressed,
+  //   and an assistant message_end landing mid-run is ignored rather than pushed.
+  // - stopReason "stop": pi-agent-core's loop emits message_end for EVERY assistant
+  //   segment, with stopReason "toolUse" on intermediate tool-calling segments; only the
+  //   final one carries "stop". Without this filter each tool segment of an external
+  //   turn would fire the hook separately.
+  let externalHook: ((text: string) => void) | undefined;
+  let busyDepth = 0;
+  session.subscribe(event => {
+    if (busyDepth > 0 || !externalHook || event.type !== "message_end" ||
+        event.message.role !== "assistant" || event.message.stopReason !== "stop") return;
+    externalHook(event.message.content.filter(block => block.type === "text").map(block => block.text).join("\n"));
+  });
   return {
     get isIdle() { return session.isIdle; },
     async run(text) {
       if (!session.isIdle) throw new Error("Session is busy");
+      busyDepth++;
       let reply: string | undefined;
       let stopReason: string = "none";
       const unsubscribe = session.subscribe(event => {
@@ -24,10 +44,14 @@ export function wrapSession(session: AgentSession): BridgeSession {
         await session.prompt(text);
         if (stopReason !== "stop" || reply === undefined) throw new AssistantResponseError(stopReason);
         return reply || "（本轮无文字回复）";
-      } finally { unsubscribe(); }
+      } finally { unsubscribe(); busyDepth--; }
     },
     abort: () => session.abort(),
-    compact: instructions => session.compact(instructions),
+    compact: async instructions => {
+      busyDepth++;
+      try { return await session.compact(instructions); }
+      finally { busyDepth--; }
+    },
     introspect: (): SessionIntrospection => ({
       model: session.model ? { provider: session.model.provider, id: session.model.id, contextWindow: session.model.contextWindow } : undefined,
       thinkingLevel: session.thinkingLevel,
@@ -36,6 +60,7 @@ export function wrapSession(session: AgentSession): BridgeSession {
       contextUsage: session.getContextUsage(),
       activeTools: session.getActiveToolNames(),
     }),
+    setExternalReplyHook: hook => { externalHook = hook; },
     dispose: () => session.dispose(),
   };
 }
