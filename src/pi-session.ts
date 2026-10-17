@@ -1,6 +1,6 @@
 import {
   createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, SettingsManager,
-  type AgentSession,
+  type AgentSession, type ResourceLoader, type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { Config } from "./config.js";
 import { AssistantResponseError, MissingMappedSessionError } from "./diagnostics.js";
@@ -34,6 +34,7 @@ export function wrapSession(session: AgentSession): BridgeSession {
       isIdle: session.isIdle,
       stats: session.getSessionStats(),
       contextUsage: session.getContextUsage(),
+      activeTools: session.getActiveToolNames(),
     }),
     dispose: () => session.dispose(),
   };
@@ -41,6 +42,59 @@ export function wrapSession(session: AgentSession): BridgeSession {
 
 /** Unknown flag names already warned about in this process: one warning per name, not per session. */
 const warnedUnknownFlags = new Set<string>();
+
+/** Heading of the generated system-prompt section that describes extension-provided tools. */
+const EXTENSION_TOOLS_HEADING = "Additional tools provided by the deployer's extensions";
+
+/** True for tools the addendum should describe: snippet-less (the system prompt's
+ *  Available-tools section already lists snippet-carrying tools, extensions/types.d.ts
+ *  promptSnippet: "Custom tools are omitted from that section when this is not provided"),
+ *  declarable exposure, and not defaultActive:false. */
+function describableTool(definition: ToolDefinition): boolean {
+  return definition.promptSnippet === undefined && definition.defaultActive !== false &&
+    (definition.exposure === undefined || definition.exposure === "direct" || definition.exposure === "model-only");
+}
+
+/**
+ * Make extension tools MODEL-VISIBLE, not just registered. pi already activates them —
+ * load-time ones in the AgentSession constructor's includeAllExtensionTools pass
+ * (agent-session.js:211-213) and lazily-registered ones in _refreshToolRegistry's
+ * no-activeToolNames branch — and active tools are declared as API tool schemas. But the
+ * system prompt's "Available tools" section lists only tools whose definition carries a
+ * promptSnippet ("Tools without a snippet are not listed", agent-session.js
+ * _rebuildSystemPrompt; system-prompt.js filters to toolSnippets), so extensions that omit
+ * promptSnippet register active yet undescribed tools the model will not discover. This
+ * delegating ResourceLoader appends a generated description section: getAppendSystemPrompt
+ * is re-read on every system-prompt rebuild (agent-session.js:1282 -> promptSections.addendum)
+ * and reads the live extension tool maps, so load-time AND later (session_start)
+ * registrations are covered alike. defaultActive:false and non-declarable tools are left out.
+ */
+function describeExtensionTools(loader: DefaultResourceLoader): ResourceLoader {
+  const describedSections = () => {
+    const tools = new Map<string, ToolDefinition>();
+    for (const extension of loader.getExtensions().extensions) {
+      for (const tool of extension.tools.values()) {
+        if (!tools.has(tool.definition.name)) tools.set(tool.definition.name, tool.definition);
+      }
+    }
+    const lines = [...tools.values()].filter(describableTool)
+      .map(definition => `- ${definition.name}: ${definition.description}`).sort();
+    return lines.length ? [`${EXTENSION_TOOLS_HEADING}:\n${lines.join("\n")}`] : [];
+  };
+  return {
+    getExtensions: () => loader.getExtensions(),
+    getSkills: () => loader.getSkills(),
+    getPrompts: () => loader.getPrompts(),
+    getThemes: () => loader.getThemes(),
+    getAgentsFiles: () => loader.getAgentsFiles(),
+    getSystemPrompt: () => loader.getSystemPrompt(),
+    getSystemPromptSource: () => loader.getSystemPromptSource(),
+    getAppendSystemPrompt: () => [...loader.getAppendSystemPrompt(), ...describedSections()],
+    getAppendSystemPromptSources: () => loader.getAppendSystemPromptSources(),
+    extendResources: paths => loader.extendResources(paths),
+    reload: options => loader.reload(options),
+  };
+}
 
 /**
  * ResourceLoader for deployer-configured extensions, or undefined when none are listed
@@ -64,7 +118,7 @@ export async function extensionResourceLoader(
   settingsManager: SettingsManager,
   extensions: readonly string[] | undefined,
   extensionFlags: Readonly<Record<string, boolean | string>> | undefined,
-): Promise<DefaultResourceLoader | undefined> {
+): Promise<ResourceLoader | undefined> {
   if (!extensions?.length) return undefined;
   const loader = new DefaultResourceLoader({
     cwd,
@@ -98,7 +152,9 @@ export async function extensionResourceLoader(
       console.error(`Extension flag "${name}" is registered by none of the configured extensions; it has no effect unless an extension reads it later.`);
     }
   }
-  return loader;
+  // Model visibility last: wrap so the generated tool descriptions ride along everywhere
+  // the loader goes (session creation, later system-prompt rebuilds, session reloads).
+  return describeExtensionTools(loader);
 }
 
 /**
@@ -141,7 +197,7 @@ export async function createSessionFactory(config: Config): Promise<SessionFacto
     : available[0];
   if (!model) throw new Error("No available configured Pi model. Run the local Pi CLI /login and /model as this service user, or supply provider API credentials. Check config.model provider/id.");
 
-  return async (cwd, record) => {
+  return async (cwd, record, opts) => {
     const path = SessionManager.findById(cwd, record.sessionId);
     if (!path && record.started) throw new MissingMappedSessionError();
     const sessionManager = path
@@ -149,9 +205,15 @@ export async function createSessionFactory(config: Config): Promise<SessionFacto
       : SessionManager.create(cwd, undefined, { id: record.sessionId });
     if (sessionManager.getSessionId() !== record.sessionId) throw new Error("Session identity mismatch");
     const settingsManager = SettingsManager.create(cwd, getAgentDir());
-    // Only pass a resourceLoader when extensions are configured; otherwise omit the
-    // option entirely so session creation is bit-identical to the pre-extension bridge.
-    const resourceLoader = await extensionResourceLoader(cwd, settingsManager, config.extensions, config.extensionFlags);
+    // Extensions are OWNER-ONLY: the loader (with its tools, flags and prompt addendum) is
+    // built solely for the owner's conversations. Everyone else gets no resourceLoader at
+    // all — createAgentSession's own default loader, bit-identical to an unconfigured
+    // deployment, so member sessions never register, activate or describe operator
+    // extensions. `opts.owner` omitted or false is fail-closed.
+    const owner = opts?.owner === true;
+    const resourceLoader = owner
+      ? await extensionResourceLoader(cwd, settingsManager, config.extensions, config.extensionFlags)
+      : undefined;
     const { session } = await createAgentSession({
       cwd, model, modelRuntime, sessionManager, settingsManager,
       ...(resourceLoader ? { resourceLoader } : {}),

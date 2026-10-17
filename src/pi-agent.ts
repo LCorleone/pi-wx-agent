@@ -224,6 +224,8 @@ export interface SessionIntrospection {
   isIdle: boolean;
   stats: SessionStats;
   contextUsage: ContextUsage | undefined;
+  /** Tool names currently declared to the model (active set). Not shown in any command. */
+  activeTools: string[];
 }
 
 export interface BridgeSession {
@@ -234,7 +236,12 @@ export interface BridgeSession {
   compact(customInstructions?: string): Promise<CompactionResult>;
   dispose(): void;
 }
-export type SessionFactory = (cwd: string, record: Readonly<Conversation>) => Promise<BridgeSession>;
+/**
+ * Creates (or resumes) the Pi session for a conversation workspace. `opts.owner` gates
+ * deployer-configured extensions: only the owner's sessions load them (fail-closed when
+ * omitted); every other session is created exactly like an unconfigured deployment.
+ */
+export type SessionFactory = (cwd: string, record: Readonly<Conversation>, opts?: { owner: boolean }) => Promise<BridgeSession>;
 
 /** Next local wall-clock dream boundary after activity (calendar arithmetic handles DST). */
 export function dreamDueAt(activity: number, hour: number): number {
@@ -488,7 +495,7 @@ export class PiAgent implements Agent {
       // Persist an intent BEFORE Pi can append a user message, including the first run.
       this.save();
     }
-    const session = await this.createSession(cwd, record);
+    const session = await this.createSession(cwd, record, { owner: this.state.owner === key });
     this.sessions.set(key, session);
     return session;
   }

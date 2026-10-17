@@ -133,7 +133,7 @@ test("extensions: exactly the listed files load, global discovery stays off; unc
       dataDir: root, model: { provider: "offline-test", id: "test-model" },
       dream: { enabled: false, hour: 3 }, extensions: [configured],
     });
-    const session = await factory(cwd, { sessionId: randomUUID(), started: false, activity: 0, reflectedActivity: 0, pendingSince: Date.now(), lastDreamSuccess: 0 });
+    const session = await factory(cwd, { sessionId: randomUUID(), started: false, activity: 0, reflectedActivity: 0, pendingSince: Date.now(), lastDreamSuccess: 0 }, { owner: true });
     assert.equal(session.isIdle, true);
     session.dispose();
   } finally {
@@ -196,11 +196,11 @@ export default (pi) => {
     const base = { dataDir: root, model: { provider: "offline-test", id: "test-model" }, dream: { enabled: false, hour: 3 } };
     const record = () => ({ sessionId: randomUUID(), started: false, activity: 0, reflectedActivity: 0, pendingSince: Date.now(), lastDreamSuccess: 0 });
     const off = await createSessionFactory({ ...base, extensions: [stub] });
-    const offSession = await off(join(root, "flag-off-ws"), record());
+    const offSession = await off(join(root, "flag-off-ws"), record(), { owner: true });
     assert.ok(!existsSync(marker), "without extensionFlags the gated extension must register nothing");
     offSession.dispose();
     const on = await createSessionFactory({ ...base, extensions: [stub], extensionFlags: { "feature-gate": true } });
-    const onSession = await on(join(root, "flag-on-ws"), record());
+    const onSession = await on(join(root, "flag-on-ws"), record(), { owner: true });
     assert.ok(existsSync(marker), "extensionFlags must let the gated extension register its tool");
     onSession.dispose();
   } finally {
@@ -242,7 +242,7 @@ export default (pi) => {
     const record = () => ({ sessionId: randomUUID(), started: false, activity: 0, reflectedActivity: 0, pendingSince: Date.now(), lastDreamSuccess: 0 });
     // Without extensionFlags: no token is pushed, the factory gate stays closed.
     const off = await createSessionFactory({ ...base, extensions: [stub] });
-    const offSession = await off(join(root, "argv-off-ws"), record());
+    const offSession = await off(join(root, "argv-off-ws"), record(), { owner: true });
     assert.ok(!existsSync(marker), "without extensionFlags the factory gate must stay closed");
     offSession.dispose();
     // With flags: tokens are pushed before the first loader.reload() can run, in CLI style.
@@ -251,7 +251,7 @@ export default (pi) => {
     assert.ok(process.argv.slice(2).includes("--factory-gate"), "boolean true pushes --name");
     assert.ok(process.argv.slice(2).includes("--text-flag=value"), "string pushes --name=value");
     assert.ok(!process.argv.some(token => token.startsWith("--off-flag")), "boolean false pushes nothing");
-    const onSession = await on(join(root, "argv-on-ws"), record());
+    const onSession = await on(join(root, "argv-on-ws"), record(), { owner: true });
     assert.ok(existsSync(marker), "the factory-time gate must see the CLI-style flag token");
     onSession.dispose();
     // Double-push guard: recreating the factory must not duplicate tokens.
@@ -303,13 +303,151 @@ export default (pi) => {
     console.error = line => handlerLines.push(line);
     let session;
     try {
-      session = await factory(join(root, "throw-ws"), { sessionId: randomUUID(), started: false, activity: 0, reflectedActivity: 0, pendingSince: Date.now(), lastDreamSuccess: 0 });
+      session = await factory(join(root, "throw-ws"), { sessionId: randomUUID(), started: false, activity: 0, reflectedActivity: 0, pendingSince: Date.now(), lastDreamSuccess: 0 }, { owner: true });
     } finally { console.error = originalError; }
     assert.ok(existsSync(marker), "the session_start handler ran");
     assert.equal(session.isIdle, true, "a throwing handler must not fail session creation");
     assert.ok(handlerLines.some(line => line.includes("session_start") && line.includes(throwing) && line.includes("offline handler failure")),
       "the handler failure must be logged naming the path and event");
     session.dispose();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("extension tools are model-visible: active, and described in the system prompt", async () => {
+  // The previous tests removed the shared offline roots; rebuild them for this test.
+  mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
+  writeFileSync(join(process.env.PI_CODING_AGENT_DIR, "models.json"), JSON.stringify({ providers: { "offline-test": {
+    baseUrl: "http://127.0.0.1:1/v1", api: "openai-completions", apiKey: "not-a-real-key",
+    models: [{ id: "test-model", contextWindow: 64000, maxTokens: 4096 }],
+  } } }));
+  // Load-time stub WITHOUT promptSnippet — the live failure shape: pi activates such tools,
+  // but the prompt's Available-tools section lists only snippet-carrying tools.
+  const quiet = join(root, "quiet-stub.js");
+  writeFileSync(quiet, `export default (pi) => {
+  pi.registerTool({
+    name: "quiet_tool", label: "Quiet", description: "offline undescribed tool",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    async execute() { return { output: "ok" }; },
+  });
+};
+`);
+  // Late stub: registers its tool in session_start, also without a snippet.
+  const late = join(root, "late-stub.js");
+  writeFileSync(late, `export default (pi) => {
+  pi.on("session_start", () => {
+    pi.registerTool({
+      name: "late_tool", label: "Late", description: "offline late tool",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+      async execute() { return { output: "ok" }; },
+    });
+  });
+};
+`);
+  try {
+    const base = { dataDir: root, model: { provider: "offline-test", id: "test-model" }, dream: { enabled: false, hour: 3 } };
+    const id = randomUUID();
+    const record = started => ({ sessionId: id, started, activity: 0, reflectedActivity: 0, pendingSince: Date.now(), lastDreamSuccess: 0 });
+    // Through the REAL bridge factory: the tool is in the model-declared active set and the
+    // built-ins stay active.
+    // Seed the session file first: pi persists sessions on prompt, and the offline model
+    // never prompts, so the resume path needs an existing JSONL (same pattern as the
+    // identity-restore test above).
+    const cwd = join(root, "vis-ws");
+    SessionManager.create(cwd, undefined, { id }).appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
+    const factory = await createSessionFactory({ ...base, extensions: [quiet] });
+    const session = await factory(cwd, record(false), { owner: true });
+    const view = session.introspect();
+    assert.ok(view.activeTools.includes("quiet_tool"), "the extension tool must be in the active set");
+    for (const builtin of ["read", "bash", "edit", "write"]) {
+      assert.ok(view.activeTools.includes(builtin), `builtin ${builtin} must stay active`);
+    }
+    session.dispose();
+    // A resumed session (same identity, started) sees the tool too.
+    const resumed = await factory(cwd, record(true), { owner: true });
+    assert.ok(resumed.introspect().activeTools.includes("quiet_tool"), "a resumed session must keep the tool active");
+    resumed.dispose();
+    // The live bug itself: the system prompt must DESCRIBE the tools. The loader appends a
+    // generated section; it is re-read at every prompt rebuild, so the late tool appears
+    // once session_start has registered it.
+    const seamCwd = join(root, "vis-seam-ws");
+    const settings = SettingsManager.create(seamCwd, process.env.PI_CODING_AGENT_DIR);
+    const loader = await extensionResourceLoader(seamCwd, settings, [quiet, late], undefined);
+    assert.ok(loader.getAppendSystemPrompt().some(part => part.includes("quiet_tool") && part.includes("offline undescribed tool")),
+      "the loader must append a description section");
+    const modelRuntime = await ModelRuntime.create({ allowModelNetwork: false });
+    const { session: direct } = await createAgentSession({
+      cwd: seamCwd, model: modelRuntime.getModel("offline-test", "test-model"), modelRuntime,
+      settingsManager: settings, resourceLoader: loader,
+      sessionManager: SessionManager.create(seamCwd, undefined, { id: randomUUID() }),
+    });
+    assert.ok(direct.systemPrompt.includes("quiet_tool"), "the prompt must describe the load-time tool");
+    assert.ok(!direct.systemPrompt.includes("late_tool"), "the late tool is not described before bring-up");
+    await direct.bindExtensions({ mode: "print" });
+    assert.ok(direct.systemPrompt.includes("late_tool"), "the prompt must describe the late tool after bring-up");
+    assert.ok(direct.getActiveToolNames().includes("late_tool"));
+    direct.dispose();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("extensions are owner-only: member sessions never load them", async () => {
+  // The previous tests removed the shared offline roots; rebuild them for this test.
+  mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
+  writeFileSync(join(process.env.PI_CODING_AGENT_DIR, "models.json"), JSON.stringify({ providers: { "offline-test": {
+    baseUrl: "http://127.0.0.1:1/v1", api: "openai-completions", apiKey: "not-a-real-key",
+    models: [{ id: "test-model", contextWindow: 64000, maxTokens: 4096 }],
+  } } }));
+  // The stub leaves a trace the moment its module loads, and registers a snippet-less tool.
+  const marker = join(root, "owner-gate.marker");
+  const stub = join(root, "owner-only-stub.js");
+  writeFileSync(stub, `import { writeFileSync } from "node:fs";
+export default (pi) => {
+  writeFileSync(${JSON.stringify(marker)}, "loaded");
+  pi.registerTool({
+    name: "owner_only_tool", label: "Owner only", description: "offline owner-only tool",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    async execute() { return { output: "ok" }; },
+  });
+};
+`);
+  try {
+    const base = { dataDir: root, model: { provider: "offline-test", id: "test-model" }, dream: { enabled: false, hour: 3 } };
+    const record = started => ({ sessionId: randomUUID(), started, activity: 0, reflectedActivity: 0, pendingSince: Date.now(), lastDreamSuccess: 0 });
+    const factory = await createSessionFactory({ ...base, extensions: [stub] });
+    // Owner session: the module loads and the tool is active and described.
+    const ownerSession = await factory(join(root, "owner-ws"), record(false), { owner: true });
+    assert.ok(existsSync(marker), "the extension must load for the owner");
+    assert.ok(ownerSession.introspect().activeTools.includes("owner_only_tool"), "owner sees the tool");
+    for (const builtin of ["read", "bash", "edit", "write"]) {
+      assert.ok(ownerSession.introspect().activeTools.includes(builtin), `builtin ${builtin} stays active`);
+    }
+    ownerSession.dispose();
+    // Member session: the extension module never even loads — nothing registers, activates
+    // or describes it. The marker doubles as the "not described" proof: with no loader built,
+    // the addendum cannot exist.
+    rmSync(marker, { force: true });
+    const memberSession = await factory(join(root, "member-ws"), record(false), { owner: false });
+    assert.ok(!existsSync(marker), "member sessions must not load the extension at all");
+    assert.ok(!memberSession.introspect().activeTools.includes("owner_only_tool"), "member must not see the tool");
+    memberSession.dispose();
+    // Fail-closed pin: dropping the owner flag must lose the tools (mutation guard).
+    rmSync(marker, { force: true });
+    const omitted = await factory(join(root, "omitted-ws"), record(false));
+    assert.ok(!existsSync(marker), "an omitted owner flag must behave like a member session");
+    assert.ok(!omitted.introspect().activeTools.includes("owner_only_tool"));
+    omitted.dispose();
+    // Member resume: a pre-existing member session stays extension-free.
+    const memberResumeId = randomUUID();
+    const memberResumeCwd = join(root, "member-resume-ws");
+    SessionManager.create(memberResumeCwd, undefined, { id: memberResumeId })
+      .appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
+    const memberResumed = await factory(memberResumeCwd, { ...record(true), sessionId: memberResumeId }, { owner: false });
+    assert.ok(!memberResumed.introspect().activeTools.includes("owner_only_tool"), "resumed member session stays extension-free");
+    assert.ok(!existsSync(marker), "member resume must not load the extension");
+    memberResumed.dispose();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

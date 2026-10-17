@@ -21,9 +21,9 @@ function fixture(t, hour = 3) {
   let now = new Date(2026, 9, 15, 23, 30).getTime();
   const sessions = [];
   const logs = [];
-  const factory = async (cwd, record) => {
+  const factory = async (cwd, record, opts) => {
     const session = {
-      cwd, id: record.sessionId, isIdle: true, calls: [], imageCalls: [], disposed: false,
+      cwd, id: record.sessionId, owner: opts?.owner, isIdle: true, calls: [], imageCalls: [], disposed: false,
       gate: undefined, started: deferred(), fail: false, compactCalls: 0, abortCalls: 0,
       async run(text, images) {
         assert.equal(this.isIdle, true, "no overlapping prompts");
@@ -1566,4 +1566,19 @@ test("management command parsing: /invite, /members, /kick", () => {
   assert.equal(parseCommand("/invited"), null);
   assert.equal(parseCommand("/membership"), null);
   assert.equal(parseCommand("/kicked"), null);
+});
+
+test("owner flag reaches the session factory per conversation (extension gating)", async t => {
+  const f = fixture(t);
+  const agent = f.make();
+  await f.claim(agent);
+  await agent.chat(message("hello"));
+  assert.equal(f.sessions.at(-1).owner, true, "the owner's conversation must request the extension path");
+  const code = await inviteCode(agent);
+  await agent.chat(message(code, "sister"));
+  await agent.chat(message("hi", "sister"));
+  assert.equal(f.sessions.at(-1).owner, false, "a member's conversation must not");
+  // An unclaimed deployment cannot create sessions anyway, but the flag stays fail-closed:
+  // dream for the same keys flows through the same session() plumbing.
+  await agent.close();
 });
